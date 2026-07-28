@@ -1,0 +1,20 @@
+{
+  "name": "ikwyd-clone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sandbox clone of iknowwhatyoudownload.com with infohash/magnet/first-seen enhancements. Zero-dependency Node.js.",
+  "main": "src/server/index.js",
+  "scripts": {
+    "seed": "node scripts/seed.js",
+    "start": "node scripts/start.js",
+    "start:live": "node scripts/start.js --live",
+    "serve": "node src/server/index.js",
+    "monitor": "node src/server/monitor.js",
+    "test": "node tests/e2e.js && node tests/unit.js && node tests/stress.js && node tests/admin.js",
+    "collect": "node src/collector/run.js --dht --tracker --pex",
+    "collect:live": "node src/collector/run.js --dht --tracker --pex"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

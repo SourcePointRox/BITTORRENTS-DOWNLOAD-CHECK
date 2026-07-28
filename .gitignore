@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Database & crawled data (never commit scraped data)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+
+# Runtime logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Research / scratch (reverse-engineering artifacts, not part of project)
+.research/
+.workbuddy/
+
+# Environment
+.env
+.env.local
+
+# Build output
+dist/
+build/
