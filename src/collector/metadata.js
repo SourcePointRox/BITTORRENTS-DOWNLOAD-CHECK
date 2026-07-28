@@ -5,6 +5,7 @@
 const net = require('net');
 const crypto = require('crypto');
 const bencode = require('../common/bencode');
+const { decodeWithNext } = bencode;
 const pipeline = require('./pipeline');
 const { normalizeInfohash } = require('../common/util');
 
@@ -84,9 +85,12 @@ function fetchFromPeer(ip, port, infohashHex) {
           if (buffer.length < 68) return;
           const pstrlen = buffer[0];
           if (buffer.slice(1, 1 + pstrlen).toString() !== PSTR.toString()) { clearTimeout(timer); return done(null); }
-          const gotHash = buffer.slice(28 + pstrlen - 20, 48 + pstrlen - 20);
+          // BT 握手: [1 pstrlen][pstr 19][reserved 8][infohash 20][peer_id 20]
+          // infohash 起始 = 1 + pstrlen + 8 = 28
+          const ihStart = 1 + pstrlen + 8;
+          const gotHash = buffer.slice(ihStart, ihStart + 20);
           if (!gotHash.equals(infohash)) { clearTimeout(timer); return done(null); }
-          buffer = buffer.slice(68); hsDone = true;
+          buffer = buffer.slice(1 + pstrlen + 48); hsDone = true; // 跳过整个握手 (1+pstr+8+20+20)
           // 发送扩展握手
           sendExt(EXT_HANDSHAKE_ID, bencode.encode({ m: { ut_metadata: UT_METADATA_ID }, metadata_size: 0, v: 'ikwyd-sandbox/0.1' }));
         }
@@ -107,16 +111,19 @@ function fetchFromPeer(ip, port, infohashHex) {
               if (utId && metaSize > 0 && metaSize < 16 * 1024 * 1024) { got = Buffer.alloc(metaSize); requestPiece(0); }
               else { clearTimeout(timer); return done(null); }
             } else if (extId === utId && utId != null) {
-              // ut_metadata 数据：bencode 头 + 原始数据
-              const d = bencode.decode(payload);
-              const headerLen = bencode.encode(d).length;
-              const data = payload.slice(headerLen);
+              // BEP-9 ut_metadata 数据消息：bencode header 字典 + 原始 piece 数据
+              // msg_type: 0=request 1=data 2=reject
+              const r = decodeWithNext(payload, 0);
+              const d = r.value;
+              const data = payload.slice(r.next); // next 精确指向 header 之后的数据起点
               const piece = d.piece || 0;
-              data.copy(got, piece * BLOCK);
-              const pieces = Math.ceil(metaSize / BLOCK);
-              if (d.msg_type === 1) { // reject
+              if (d.msg_type === 2) { // reject —— 对方拒绝提供
                 clearTimeout(timer); return done(null);
               }
+              if (d.msg_type === 1 && data.length > 0) { // data —— 写入对应分片
+                data.copy(got, piece * BLOCK);
+              }
+              const pieces = Math.ceil(metaSize / BLOCK);
               reqIndex++;
               if (reqIndex < pieces) requestPiece(reqIndex);
               else { clearTimeout(timer); return done(got); }
@@ -129,21 +136,42 @@ function fetchFromPeer(ip, port, infohashHex) {
   });
 }
 
-/* 元数据解析并入库 */
+/* 诊断计数器：统计失败原因分布，定期输出帮助定位问题 */
+const diag = { conn: 0, hs: 0, sha: 0, noname: 0, ok: 0, total: 0, debug: 0 };
+setInterval(() => {
+  if (diag.total === 0) return;
+  console.log(`[meta-diag] 尝试 ${diag.total} | 连接/握手失败 ${diag.conn} | SHA不匹配 ${diag.sha} | 无name ${diag.noname} | 成功 ${diag.ok}`);
+  diag.conn = diag.hs = diag.sha = diag.noname = diag.ok = diag.total = 0;
+}, 30000).unref();
+
+/* 元数据解析并入库：并行尝试多个 peer（DHT peer 质量参差，并行提高成功率） */
 async function resolveAndStore(infohashHex, peersList) {
   const infohash = normalizeInfohash(infohashHex);
   if (!infohash) return null;
-  for (const p of peersList.slice(0, 5)) {
-    const raw = await fetchFromPeer(p.ip, p.port, infohash);
-    if (!raw) continue;
+  // 并行尝试最多 20 个 peer，取第一个 SHA-1 匹配的结果
+  const candidates = peersList.slice(0, 20);
+  diag.total += candidates.length;
+  const tasks = candidates.map(p =>
+    fetchFromPeer(p.ip, p.port, infohash).then(raw => ({ raw, peer: p }))
+  );
+  const results = await Promise.allSettled(tasks);
+  for (const r of results) {
+    if (r.status !== 'fulfilled' || !r.value || !r.value.raw) { diag.conn++; continue; }
+    const raw = r.value.raw;
+    if (raw.length < 1) { diag.conn++; continue; }
     const hash = crypto.createHash('sha1').update(raw).digest('hex');
-    if (hash !== infohash) continue;
+    if (hash !== infohash) {
+      diag.sha++;
+      if (diag.debug < 5) { diag.debug++; console.log('[meta-debug] SHA mismatch', infohash.slice(0,12), 'got', hash.slice(0,12), 'len', raw.length); }
+      continue;
+    }
     const meta = parseInfo(raw);
-    if (!meta.name) continue;
+    if (!meta.name) { diag.noname++; continue; }
     pipeline.upsertTorrentMeta({
       infohash, name: meta.name, size: meta.size, files: meta.files,
       category: classify(meta.name), metadata_ok: 1, first_seen: Date.now(), last_seen: Date.now(),
     });
+    diag.ok++;
     return meta;
   }
   return null;

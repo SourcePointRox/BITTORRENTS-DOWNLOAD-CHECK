@@ -1,16 +1,17 @@
 # BITTORRENTS-DOWNLOAD-CHECK
 
-BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 DHT / PEX / Tracker / P2P 网络，实时监控与采集种子元数据。
+BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 DHT / PEX / Tracker / P2P 网络，实时监控与采集种子元数据，基于 ip-api.com 的真实 IP 地理位置解析。
 
-零第三方依赖（Node.js ≥ 22.5 标准库 + 内置 `node:sqlite`），可离线运行。
+零第三方依赖（Node.js ≥ 22.5 标准库 + 内置 `node:sqlite`），可离线启动。
 
 ## 功能概览
 
 - **全网络采集**：DHT (BEP-5/51) + PEX (BEP-11) + Tracker (HTTP/UDP, BEP-3/15) + BitTorrent P2P (BEP-9/10)
-- **元数据解析**：BT 握手 → ut_metadata 拉取 info 字典 → SHA-1 校验 → 自动分类
-- **Web 站点**：完整复刻 iknowwhatyoudownload.com 全站功能，增强展示 infohash / magnet / first-seen
+- **真实 GeoIP**：基于 ip-api.com 批量查询（中文返回），内存+DB 双层缓存，30 天自动刷新，批量补写 country_daily
+- **元数据解析**：BT 握手 → ut_metadata 拉取 info 字典 → SHA-1 校验 → 自动分类，并行 20 peer + 重试机制
+- **Web 站点**：完整复刻 iknowwhatyoudownload.com 全站功能，增强展示 infohash / magnet / first-seen / 资源大小
 - **REST API**：对齐官方 Peer/Torrent/Content API，免 Key 沙箱模式
-- **监控 WebUI**：独立端口运行，实时展示采集速率、DHT 路由表、来源分布、系统资源、健康度
+- **监控 WebUI**：独立端口运行，多来源堆叠图表（平滑过渡）、健康度评估、系统资源趋势
 - **自动端口检测**：默认端口被占用时自动切换到可用端口
 
 ## 快速开始
@@ -19,18 +20,19 @@ BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 
 
 - **Node.js ≥ 22.5**（需要内置 `node:sqlite` 模块）
 - 公网 UDP/TCP 出站能力（真实采集模式需要；模拟模式无需联网）
+- 外网访问 ip-api.com（GeoIP 解析；不可用时降级为占位，不阻断服务）
 
 ### 一键启动
 
 ```bash
-# 模拟采集模式（默认，无需公网）
+# 模拟采集模式（默认，无需公网，生成演示数据）
 node scripts/start.js
 
 # 真实 DHT + PEX + Tracker 全网络采集
 node scripts/start.js --live
 
 # 指定端口
-node scripts/start.js --port 9000 --monitor-port 9090
+node scripts/start.js --live --port 9000 --monitor-port 9090
 
 # 仅启动站点（不启动采集器）
 node scripts/start.js --no-collector
@@ -38,12 +40,12 @@ node scripts/start.js --no-collector
 
 Windows 下也可双击 `start.bat`。
 
-启动后控制台会输出各服务地址：
+启动后控制台输出各服务地址：
 
 ```
 [start] ========================================
-[start] 主站点:        http://localhost:8081
-[start] 监控WebUI:     http://localhost:8090
+[start] 主站点:        http://localhost:9080
+[start] 监控WebUI:     http://localhost:9090
 [start] 采集模式:      live
 [start] ========================================
 ```
@@ -78,7 +80,7 @@ node scripts/start.js --live
 首次启动会自动生成演示数据（约 30 天模拟采集量），随后启动：
 - 主站点（前端 + 后端 API）
 - 独立监控 WebUI（独立端口）
-- 采集器（DHT + PEX + Tracker）
+- 采集器（DHT + PEX + Tracker + GeoIP 批量查询）
 
 ### 3. 验证运行
 
@@ -88,7 +90,21 @@ node scripts/start.js --live
 - **来源分布** 出现 `dht_active` / `dht_sample` / `tracker` 来源
 - **健康度** 显示绿色（≥ 70）
 
-### 4. 生产部署建议
+### 4. 验证 GeoIP 解析
+
+```bash
+# 查看已解析的 IP 地理位置（应为真实城市）
+node -e "const db=require('./src/server/db'); db.open(); db.get().prepare('SELECT ip,cc,region,city,isp FROM ip_geo LIMIT 10').all().forEach(r=>console.log(r.ip,'|',r.cc,r.region,r.city,'|',r.isp));"
+```
+
+预期输出（示例）：
+```
+221.0.47.175 | CN Shandong Qingdao | CNC Group CHINA169 Shandong Province Network
+223.73.130.144 | CN Guangdong Foshan | China Mobile communications corporation
+18.163.110.130 | HK Central and Western Hong Kong | Amazon Technologies Inc.
+```
+
+### 5. 生产部署建议
 
 ```bash
 # 使用 PM2 等进程管理器
@@ -103,7 +119,7 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 - **公网 IP**：真实采集需要公网 IP 或 NAT 穿透
 - **带宽**：DHT 采集约产生 10-50 KB/s 流量
 - **磁盘**：SQLite 数据库约 1-10 MB/万种子
-- **GeoIP**：替换 `src/server/geo.js` 中的 `demoResolve` 为 MaxMind GeoLite2 查询
+- **ip-api.com 限速**：免费版 45 请求/分钟，批量接口每批 100 IP。系统已内置 5 秒间隔的批量队列
 
 ## 采集网络详解
 
@@ -117,7 +133,8 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 - **被动模式**：应答他人的 `get_peers` / `announce_peer`，从 `announce_peer` 捕获真实做种
 - **BEP-51**：`sample_infohashes` 批量发现 infohash，发现后立即对其 `get_peers` 找 peer
 - **路由表**：最多 2000 节点，定期更换节点 ID 扩大覆盖
-- **Bootstrap**：20 个全球 DHT 引导节点，并行入网
+- **Bootstrap**：20 个全球 DHT 引导节点，并行入网，失败自动串行重试
+- **端口冲突处理**：UDP 6881 被占用时自动递增端口（最多重试 20 个）
 
 ### PEX 采集器（BEP-11）
 
@@ -135,7 +152,7 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 - **HTTP Tracker**（BEP-3）：紧凑 peer 格式解析
 - **UDP Tracker**（BEP-15）：连接握手 → announce → peer 列表
 - **26 个公共 Tracker**：覆盖全球各地区（HTTP + UDP）
-- 分批并发请求，避免瞬时连接爆炸
+- 分批并发请求（每批 5 个），避免瞬时连接爆炸
 
 ### 元数据抓取（BEP-9 / BEP-10）
 
@@ -145,6 +162,32 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 - bencode 解析 name / files / length
 - SHA-1 校验 infohash 完整性
 - 规则引擎分类（Movies / TV / Anime / Music / Games / Software / Books / XXX / Unsorted）
+- **并行 20 peer**（DHT peer 质量参差，并行提高成功率）
+- **重试机制**：每 10 秒对有 peer 但无 metadata 的种子重新解析，优先 announce_peer 真实做种者
+
+### GeoIP 地理位置解析
+
+`src/server/geo.js` — 基于 ip-api.com 的真实批量查询
+
+- **批量查询**：ip-api.com batch API（每批 100 IP，中文返回，含省/市/ISP/经纬度/时区）
+- **三层缓存**：内存缓存 → DB 缓存 → API 查询
+- **后台队列**：新 IP 同步返回占位值，异步加入待查队列，每 5 秒批量处理
+- **定期刷新**：每 2 小时刷新超 30 天的旧缓存
+- **补写机制**：每 30 秒补写之前因占位跳过的 country_daily 统计
+- **私有 IP 检测**：10.x / 172.16-31.x / 192.168.x / 127.x / IPv6 ULA 直接返回 Local
+- **降级策略**：API 不可用时返回占位值（`_pending: true`），不阻断服务
+
+```bash
+# 验证 ip-api.com 批量查询
+node -e "async function t(){const ips=['8.8.8.8','114.114.114.114','218.26.74.1'];const r=await fetch('http://ip-api.com/batch?fields=query,countryCode,regionName,city,isp&lang=zh',{method:'POST',body:JSON.stringify(ips),headers:{'Content-Type':'application/json'}});(await r.json()).forEach(x=>console.log(x.query,'|',x.countryCode,x.regionName,x.city,'|',x.isp));}t();"
+```
+
+预期输出：
+```
+8.8.8.8 | US Virginia Ashburn | Google LLC
+114.114.114.114 | CN Shandong Jinan | China Unicom Shandong Province network
+218.26.74.1 | CN Shanxi Taiyuan | CNC Group CHINA169 Shanxi Province Network
+```
 
 ## 监控 WebUI
 
@@ -152,14 +195,19 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 
 | 模块 | 内容 |
 |---|---|
-| 核心指标 | 采集模式 / 种子总数 / IP 节点 / 采集速率 / DHT 节点 / 健康度 |
-| 采集器状态 | DHT / Tracker / PEX 各采集器运行状态与发现 peer 数 |
-| 趋势图表 | 近 60 分钟每分钟采集事件数（折线图） |
-| 来源分布 | DHT / Tracker / PEX / 模拟器（环形进度条） |
-| 实时事件流 | 最近 30 条观测（时间 / IP / infohash / 资源名 / 来源徽章） |
-| DHT 路由表 | 节点 ID / 地址 / 最后活跃时间 |
-| 系统资源 | 内存 RSS / 堆使用 / 运行时长 / 平台信息 |
-| 元数据处理 | 已解析 / 失败 / 队列长度 |
+| 核心指标 | 采集模式 / 种子总数 / IP 节点 / 采集速率（含峰值均值）/ DHT 节点 / 元数据成功率 / 累计事件 / 健康度 |
+| 采集器状态 | DHT / Tracker / PEX 各采集器运行状态 + 发现 peer 数 + rx/tx 流量 |
+| 趋势图表 | 多来源堆叠面积图（DHT被动/主动/采样 + Tracker + PEX），15m/1h/3h/6h 时间窗口切换 |
+| 来源分布 | 百分比 + 进度条 |
+| 元数据进度 | 种子总数 / 已解析名 / 已解析 size / 元数据 OK + size 落库率进度条 |
+| Top 国家 | 近 24h 地理分布 |
+| 实时事件流 | 最近 30 条观测（时间 / IP / 资源名 / **大小** / 来源徽章） |
+| DHT 路由表 | 节点 ID / 地址 / 年龄 |
+| 系统资源 | 内存 RSS / 堆使用 / 运行时长 / Node 版本 + 内存占用趋势曲线 |
+
+### 平滑过渡
+
+图表使用 `chart.update()` 而非 `destroy() + new Chart()`，避免整图闪动重建，配合 400ms easeOutQuart 动画实现顺滑过渡。
 
 ### 健康度评估
 
@@ -173,7 +221,7 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 
 | 端点 | 说明 |
 |---|---|
-| `GET /api/stats` | 完整采集统计 + 系统指标 |
+| `GET /api/stats?mins=60` | 完整采集统计 + 系统指标 + 多来源分时数据 + Top国家 |
 | `GET /api/nodes` | DHT 路由表节点列表 |
 | `GET /api/health` | 健康度 + 系统信息 |
 | `GET /api/trend` | 近 6 小时采集趋势 |
@@ -184,7 +232,7 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 
 | 页面 | 路由 | 说明 |
 |---|---|---|
-| IP 下载记录 | `/en/peer/?ip=` | 地理标签 + 下载表格（含 infohash / magnet / first-seen 增强列） |
+| IP 下载记录 | `/en/peer/?ip=` | 地理标签 + 下载表格（含 infohash / magnet / first-seen / **资源大小**） |
 | Track Downloads | `/en/link/` | 短链追踪 → 访问记录 → 轮询 |
 | 日统计 | `/en/stat/daily` | 三项比率 + 分类饼图 + Top 12 + 海报墙 |
 | 年度统计 | `/en/stat/annual` | 月度分类汇总 + 柱状图 |
@@ -196,10 +244,10 @@ pm2 start scripts/start.js --name bittorrents-monitor -- --live
 
 | 端点 | 说明 |
 |---|---|
-| `GET /api/history/peer?ip=&days=&contents=` | Peer 下载历史（含 magnet + firstSeen） |
+| `GET /api/history/peer?ip=&days=&contents=` | Peer 下载历史（含 magnet + firstSeen + size） |
 | `GET /api/history/peers?cidr=` | CIDR 内已知 IP |
 | `GET /api/history/exist?ip=` | IP 是否存在 |
-| `GET /api/torrent/info/{infohash}` | 种子信息（含 magnet + files） |
+| `GET /api/torrent/info/{infohash}` | 种子信息（含 magnet + files + size） |
 | `GET /api/torrent/peers/{infohash}?day=` | 按日 peer 统计 |
 | `GET /api/content/summary?day=` | 内容汇总报告 |
 | `GET /api/content/downloads?day=` | 日下载报告 |
@@ -215,39 +263,36 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制（18 
 # 或 npm test（依次全部运行）
 ```
 
-当前状态：**125/125 全部通过**；灌入吞吐约 9500 事件/s。
-
 ## 目录结构
 
 ```
 ├── src/
 │   ├── collector/
-│   │   ├── dht.js          # DHT 爬虫（BEP-5/51，被动+主动+sample_infohashes）
-│   │   ├── pex.js          # PEX 采集器（BEP-11 ut_pex，IPv4+IPv6）
+│   │   ├── dht.js          # DHT 爬虫（BEP-5/51，被动+主动+sample_infohashes，20 bootstrap 节点）
+│   │   ├── pex.js          # PEX 采集器（BEP-11 ut_pex，IPv4+IPv6 peer 发现）
 │   │   ├── tracker.js       # Tracker 抓取器（HTTP BEP-3 + UDP BEP-15，26 个公共 tracker）
-│   │   ├── metadata.js     # 元数据抓取（BEP-9/10 ut_metadata，SHA-1 校验）
-│   │   ├── pipeline.js     # 统一采集管道（去重/聚合/入库/日统计）
-│   │   ├── service.js      # 采集服务调度（sim/live 模式切换、PEX/Tracker 定时器）
+│   │   ├── metadata.js     # 元数据抓取（BEP-9/10 ut_metadata，SHA-1 校验，并行20 peer+重试）
+│   │   ├── pipeline.js     # 统一采集管道（去重/聚合/入库/日统计，busy_timeout 容错）
+│   │   ├── service.js      # 采集服务调度（sim/live 模式、PEX/Tracker/元数据重试/GeoIP 定时器）
 │   │   ├── simulator.js    # 沙箱模拟数据源
 │   │   └── run.js          # 独立采集入口（--dht --tracker --pex）
 │   ├── common/
-│   │   ├── bencode.js      # Bencode 编解码（BEP-3）
+│   │   ├── bencode.js      # Bencode 编解码（BEP-3，decodeWithNext 精确定位）
 │   │   ├── util.js          # 通用工具（哈希/magnet/base32/格式化）
-│   │   └── ports.js         # 端口自动检测工具
+│   │   └── ports.js         # 端口自动检测工具（IPv4/IPv6 双栈）
 │   └── server/
 │       ├── index.js        # HTTP 服务主入口
 │       ├── api.js          # REST API 层
 │       ├── pages.js        # SSR 页面渲染
 │       ├── admin.js        # 内嵌管理面板
-│       ├── monitor.js      # 独立监控 WebUI（专门监控后端运行状态）
-│       ├── db.js            # 存储层（node:sqlite, WAL, busy_timeout）
-│       └── geo.js           # GeoIP 模块（可插拔，预留 MaxMind 接口）
+│       ├── monitor.js      # 独立监控 WebUI（多来源堆叠图+平滑过渡+健康度）
+│       ├── db.js            # 存储层（node:sqlite, WAL, busy_timeout, ALTER TABLE 兼容）
+│       └── geo.js           # GeoIP 模块（ip-api.com 批量查询，三层缓存，降级策略）
 ├── public/assets/          # 静态资源（Bootstrap3/jQuery/Chart.js/FontAwesome 本地化）
 ├── scripts/
 │   ├── start.js            # 一键启动（端口检测 → 站点 + 监控 + 采集）
-│   ├── seed.js             # 演示数据生成
-│   └── check-stats.js      # 采集状态检查工具
-├── tests/                  # e2e / unit / stress / admin 测试
+│   └── seed.js             # 演示数据生成
+├── tests/                  # e2e / unit / stress / admin 测试（125 项全通过）
 ├── docs/ARCHITECTURE.md    # 架构设计文档
 └── package.json
 ```
@@ -262,18 +307,19 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制（18 
 | 发现 infohash | 100-500 | 1000-5000 | 5000-20000 |
 | 采集速率 | 50-100/min | 100-200/min | 150-300/min |
 | Tracker peers | 10-50 | 50-200 | 100-500 |
-| 元数据解析 | 0-10 | 5-50 | 10-100 |
+| GeoIP 解析 | 实时批量 | — | — |
 
 > 性能取决于网络环境、DHT 节点质量、tracker 可用性等因素。
 
 ## 技术要点
 
 - **零依赖**：仅使用 Node.js 标准库 + `node:sqlite`，无需 `npm install`
-- **自研 bencode**：完整 Bencode 编解码，支持 Buffer/字典序/原始字节区间提取
-- **WAL 模式**：SQLite WAL + busy_timeout，支持高并发写入
+- **自研 bencode**：完整 Bencode 编解码，支持 Buffer/字典序/`decodeWithNext` 精确定位
+- **WAL 模式**：SQLite WAL + busy_timeout 5s，支持高并发写入
 - **日粒度去重**：同一 (ip, infohash, day) 仅计一次，减少写放大
 - **端口自动检测**：IPv4/IPv6 双栈检测，被占用时自动切换
 - **健康度评估**：综合 DHT 节点数、采集速率、元数据成功率评分
+- **GeoIP 三层缓存**：内存 → DB → ip-api.com 批量查询，降级不阻断
 
 ## 许可与声明
 
@@ -283,5 +329,6 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制（18 
 
 - Node.js ≥ 22.5（标准库 + `node:sqlite`）
 - BitTorrent 协议：BEP-3 / BEP-5 / BEP-9 / BEP-10 / BEP-11 / BEP-15 / BEP-23 / BEP-51
+- GeoIP：ip-api.com batch API（中文返回，三层缓存）
 - 前端：Bootstrap 3 + jQuery + Chart.js（全部本地化）
 - 存储：SQLite (WAL 模式)

@@ -73,13 +73,17 @@ CREATE TABLE IF NOT EXISTS country_daily (
 );
 
 CREATE TABLE IF NOT EXISTS ip_geo (
-  ip      TEXT PRIMARY KEY,
-  cc      TEXT,
-  country TEXT,
-  city    TEXT,
-  lat     REAL,
-  lon     REAL,
-  isp     TEXT
+  ip        TEXT PRIMARY KEY,
+  cc        TEXT,
+  country   TEXT,
+  region    TEXT,
+  city      TEXT,
+  lat       REAL,
+  lon       REAL,
+  timezone  TEXT,
+  continent TEXT,
+  isp       TEXT,
+  resolved_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_links (
@@ -108,6 +112,10 @@ function open(file) {
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA busy_timeout = 5000;'); // 等待锁最多 5 秒
   db.exec(SCHEMA);
+  // 兼容旧库：为 ip_geo 补充新增列（已存在则忽略）
+  for (const col of ['region', 'timezone', 'continent', 'resolved_at']) {
+    try { db.exec(`ALTER TABLE ip_geo ADD COLUMN ${col} ${col === 'resolved_at' ? 'INTEGER' : 'TEXT'}`); } catch (_) {}
+  }
   return db;
 }
 

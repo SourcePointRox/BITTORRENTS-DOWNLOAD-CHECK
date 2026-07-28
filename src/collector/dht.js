@@ -51,27 +51,31 @@ class DHTSpider {
   }
 
   start() {
-    this.sock = dgram.createSocket('udp4');
-    this.sock.on('message', (msg, rinfo) => this._onMessage(msg, rinfo));
-    this.sock.on('error', (err) => {
+    this._bindSocket(this.port);
+    this.queryTimer = setInterval(() => this._activeQuery(), QUERY_INTERVAL);
+    this.refreshTimer = setInterval(() => this._makeNodeIdYounger(), 15 * 60 * 1000);
+    return this;
+  }
+
+  /* 创建 socket 并 bind；EADDRINUSE 时关闭旧 socket、递增端口、创建新 socket 重试 */
+  _bindSocket(port) {
+    const sock = dgram.createSocket('udp4');
+    sock.on('message', (msg, rinfo) => this._onMessage(msg, rinfo));
+    sock.on('error', (err) => {
       if (err && err.code === 'EADDRINUSE') {
-        // 端口被占用，尝试下一个端口
         this.port++;
         console.log(`[dht] port ${this.port - 1} in use, trying ${this.port}`);
-        try { this.sock.close(); } catch (_) {}
-        setTimeout(() => { try { this.sock.bind(this.port); } catch (_) {} }, 100);
+        try { sock.close(); } catch (_) {}
+        if (this.port - (port) < 20) this._bindSocket(this.port); // 最多重试 20 个端口
       }
     });
-    this.sock.on('listening', () => {
+    sock.on('listening', () => {
       console.log(`[dht] listening on UDP ${this.port}`);
       this.running = true;
       this._bootstrap();
     });
-    this.sock.bind(this.port);
-    if (!this.running) this.running = true; // 乐观设置，bootstrap 会在 listening 后触发
-    this.queryTimer = setInterval(() => this._activeQuery(), QUERY_INTERVAL);
-    this.refreshTimer = setInterval(() => this._makeNodeIdYounger(), 15 * 60 * 1000);
-    return this;
+    this.sock = sock;
+    try { sock.bind(this.port); } catch (_) {}
   }
 
   stop() {

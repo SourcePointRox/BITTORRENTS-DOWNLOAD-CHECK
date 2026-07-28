@@ -7,6 +7,7 @@ const { DHTSpider } = require('./dht');
 const tracker = require('./tracker');
 const metadata = require('./metadata');
 const pex = require('./pex');
+const geo = require('../server/geo');
 const { randomHex } = require('../common/util');
 
 const RING_CAP = 500;
@@ -52,6 +53,11 @@ class CollectorService {
       } catch (_) {}
     }, intervalMs);
     this.simTimer.unref && this.simTimer.unref();
+    // 模拟模式也启动 GeoIP 批量查询（模拟 IP 也需真实解析）
+    this.geoFlushTimer = setInterval(() => geo.flushPending(), 5000);
+    this.geoFlushTimer.unref && this.geoFlushTimer.unref();
+    this.geoBackfillTimer = setInterval(() => geo.backfillCountryDaily(), 30000);
+    this.geoBackfillTimer.unref && this.geoBackfillTimer.unref();
     return { mode: this.mode };
   }
 
@@ -81,6 +87,19 @@ class CollectorService {
       this.pexTimer = setInterval(() => this._pexHarvest(), 45000);
       this.pexTimer.unref && this.pexTimer.unref();
     }
+    // 元数据重试：定期对有 peer 但无 metadata 的种子重新解析
+    if (opts.retryMeta !== false) {
+      this.retryTimer = setInterval(() => this._retryMeta(), 10000);
+      this.retryTimer.unref && this.retryTimer.unref();
+    }
+    // GeoIP 批量查询：每 5 秒处理待查队列，每 2 小时刷新旧缓存
+    this.geoFlushTimer = setInterval(() => geo.flushPending(), 5000);
+    this.geoFlushTimer.unref && this.geoFlushTimer.unref();
+    this.geoRefreshTimer = setInterval(() => geo.refresh(), 2 * 3600 * 1000);
+    this.geoRefreshTimer.unref && this.geoRefreshTimer.unref();
+    // GeoIP 补写：每 30 秒补写之前因占位跳过的 country_daily
+    this.geoBackfillTimer = setInterval(() => geo.backfillCountryDaily(), 30000);
+    this.geoBackfillTimer.unref && this.geoBackfillTimer.unref();
     return { mode: this.mode };
   }
 
@@ -88,6 +107,10 @@ class CollectorService {
     if (this.simTimer) { clearInterval(this.simTimer); this.simTimer = null; }
     if (this.trackerTimer) { clearInterval(this.trackerTimer); this.trackerTimer = null; }
     if (this.pexTimer) { clearInterval(this.pexTimer); this.pexTimer = null; }
+    if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
+    if (this.geoFlushTimer) { clearInterval(this.geoFlushTimer); this.geoFlushTimer = null; }
+    if (this.geoRefreshTimer) { clearInterval(this.geoRefreshTimer); this.geoRefreshTimer = null; }
+    if (this.geoBackfillTimer) { clearInterval(this.geoBackfillTimer); this.geoBackfillTimer = null; }
     if (this.spider) { this.spider.stop(); this.spider = null; }
     this.mode = 'off';
     this.startedAt = null;
@@ -118,7 +141,7 @@ class CollectorService {
     if (!ih) return;
     this.metaWorking++;
     try {
-      const rows = db.get().prepare('SELECT ip,port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 5').all(ih);
+      const rows = db.get().prepare('SELECT ip,port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 20').all(ih);
       const m = await metadata.resolveAndStore(ih, rows);
       if (m) this.counters.metaResolved++; else this.counters.metaFailed++;
     } catch (_) { this.counters.metaFailed++; }
@@ -126,8 +149,31 @@ class CollectorService {
     if (this.metaQueue.length) this._pumpMeta();
   }
 
+  /* 元数据重试：定期对有 peer 但无 metadata 的种子重新解析。
+     DHT 网络中 peer 质量参差，首次解析常因 peer 不可达而失败，
+     积累更多 peer 后重试可显著提升 size 落库率。
+     优先用 announce_peer（dht_passive）的 peer —— 这些是真实声明做种的 peer。 */
+  _retryMeta() {
+    if (this.metaWorking > 3) return;
+    const d = db.get();
+    // 取有 3+ peer 但无 metadata 的种子，优先 announce_peer 来源的
+    const row = d.prepare(`
+      SELECT t.infohash, COUNT(o.id) AS pc,
+        SUM(CASE WHEN o.source = 'dht_passive' THEN 1 ELSE 0 END) AS ap
+      FROM torrents t
+      JOIN obs_log o ON o.infohash = t.infohash AND o.port IS NOT NULL
+      WHERE t.metadata_ok = 0 AND t.name IS NULL
+      GROUP BY t.infohash HAVING pc >= 3
+      ORDER BY ap DESC, pc DESC LIMIT 1
+    `).get();
+    if (!row) return;
+    this.metaQueue.push(row.infohash);
+    this._pumpMeta();
+  }
+
   async _harvestSome() {
-    const rows = db.get().prepare('SELECT infohash FROM torrents ORDER BY last_seen DESC LIMIT 3').all();
+    // 对最近活跃的种子做 tracker harvest，获取真实做种者（比 DHT peer 质量高）
+    const rows = db.get().prepare('SELECT infohash FROM torrents ORDER BY last_seen DESC LIMIT 8').all();
     for (const r of rows) {
       try {
         const found = await tracker.harvest(r.infohash, (ev) => this._ingest(ev));
@@ -147,7 +193,7 @@ class CollectorService {
     `).all(Date.now() - 600000); // 10 分钟内有观测
     for (const r of rows) {
       try {
-        const peers = d.prepare('SELECT ip, port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 5').all(r.infohash);
+        const peers = d.prepare('SELECT ip, port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 20').all(r.infohash);
         if (!peers.length) continue;
         const discovered = await pex.harvest(r.infohash, peers, (ev) => this._ingest(ev));
         this.counters.pexPeers = (this.counters.pexPeers || 0) + discovered.length;

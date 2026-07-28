@@ -38,6 +38,13 @@ function decode(buf, start = 0) {
   return r.value;
 }
 
+/* 解码并返回 { value, next }：next 指向该 bencode 元素结束后的下一字节。
+   用于精确定位 BEP-9 ut_metadata 数据消息中 header 字典的边界，
+   避免"解码后再编码"计算长度时因 key 顺序/数字编码差异导致切错位置。 */
+function decodeWithNext(buf, start = 0) {
+  return _dec(buf, start);
+}
+
 function _dec(buf, i) {
   if (i >= buf.length) throw new Error('bencode: unexpected end');
   const c = buf[i];
@@ -88,4 +95,4 @@ function findKeyRaw(buf, key) {
   return null;
 }
 
-module.exports = { encode, decode, findKeyRaw };
+module.exports = { encode, decode, decodeWithNext, findKeyRaw };
