@@ -101,21 +101,34 @@ async function main() {
   const dashHtml = await dashPage.text();
   ok('仪表盘含 24h 趋势按钮', dashHtml.includes('data-mins="1440"') && dashHtml.includes('24h'));
 
-  // 5.3 /api/stats 全面板数据完整性
+  // 5.3 /api/stats 轻量面板数据完整性（重图表数据已拆分到 /api/charts）
   const ms = await fetch(MB + '/api/stats?mins=60').then(r => r.json());
-  ok('stats 含 perMinuteBySource', Array.isArray(ms.perMinuteBySource) && ms.perMinuteBySource.length > 0);
-  ok('stats 含 sources 来源分布', Array.isArray(ms.sources));
-  ok('stats 含 topCountries', Array.isArray(ms.topCountries));
   ok('stats 含 meta 元数据进度', ms.meta && typeof ms.meta.total === 'number' && typeof ms.meta.withMeta === 'number');
   ok('stats 含 meta.versions 版本分布', ms.meta.versions && typeof ms.meta.versions.v1 === 'number');
   ok('stats 含 ipv6 统计', ms.ipv6 && typeof ms.ipv6.pct === 'number');
   ok('stats 含 system 系统资源', ms.system && typeof ms.system.rss === 'number');
   ok('stats 含 health 健康度', typeof ms.health === 'number');
 
+  // 5.3b /api/charts 重量图表数据（分步加载端点）
+  const mc = await fetch(MB + '/api/charts?mins=60').then(r => r.json());
+  ok('charts 含 perMinuteBySource', Array.isArray(mc.perMinuteBySource) && mc.perMinuteBySource.length > 0);
+  ok('charts 含 sources 来源分布', Array.isArray(mc.sources));
+  ok('charts 含 topCountries', Array.isArray(mc.topCountries));
+
   // 5.4 24h 趋势查询（小时桶优化）
-  const ms24 = await fetch(MB + '/api/stats?mins=1440').then(r => r.json());
+  const ms24 = await fetch(MB + '/api/charts?mins=1440').then(r => r.json());
   ok('24h 趋势返回小时桶（<=30 个）', ms24.perMinuteBySource.length <= 30 && ms24.perMinuteBySource.length > 0,
     `len=${ms24.perMinuteBySource.length}`);
+
+  // 5.4b /api/trackers 全量 tracker 详情（存活排序在前）
+  const mt = await fetch(MB + '/api/trackers').then(r => r.json());
+  ok('trackers 接口返回全量列表', Array.isArray(mt.list) && typeof mt.total === 'number');
+  if (mt.list.length > 1) {
+    const rank = (a) => a.alive === true ? 0 : a.alive === false ? 2 : 1;
+    let sorted = true;
+    for (let i = 1; i < mt.list.length; i++) if (rank(mt.list[i]) < rank(mt.list[i - 1])) { sorted = false; break; }
+    ok('tracker 列表存活在前死亡在后', sorted);
+  }
 
   // 5.5 /api/nodes
   const mnodes = await fetch(MB + '/api/nodes').then(r => r.json());

@@ -136,3 +136,122 @@ html, body { height: 100%; }
     padding: 20px 0;
     background: #f8f8f8;
 }
+
+/* ===== 站点美化层（v0.6）：正式化布局与比例 ===== */
+body {
+    background: #f2f4f7;
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+/* 顶部导航：白底 + 柔和阴影，品牌区垂直居中 */
+.site-nav {
+    background: #ffffff;
+    box-shadow: 0 2px 10px rgba(20, 30, 45, 0.08);
+    border-bottom: 1px solid #e6e9ee;
+    padding-top: 8px;
+    padding-bottom: 8px;
+}
+.site-nav .navbar-brand { padding: 0; margin-right: 18px; }
+.site-nav .navbar-brand img { display: block; }
+.site-nav .nav-link {
+    font-size: 13.5px;
+    color: #44505e;
+    padding: 8px 12px !important;
+    border-radius: 5px;
+    margin: 0 1px;
+    transition: background-color .15s ease, color .15s ease;
+}
+.site-nav .nav-link:hover, .site-nav .nav-link:focus {
+    background-color: #eef4ef;
+    color: #237a4a;
+}
+.site-nav .nav-link.active {
+    background-color: #2e8b57;
+    color: #fff !important;
+}
+
+/* 搜索区：输入框与按钮统一小尺寸、同高对齐、比例协调 */
+.nav-search { align-items: center; flex-wrap: nowrap; }
+.nav-search .form-control-sm {
+    width: 190px;
+    height: 32px;
+    border-radius: 5px;
+    border: 1px solid #cfd6de;
+    margin-right: 6px;
+    font-size: 13px;
+}
+.nav-search .form-control-sm:focus {
+    border-color: #2e8b57;
+    box-shadow: 0 0 0 2px rgba(46, 139, 87, 0.15);
+}
+.nav-search .btn-sm {
+    height: 32px;
+    padding: 0 14px;
+    font-size: 13px;
+    border-radius: 5px;
+    white-space: nowrap;
+}
+
+/* 内容卡片：白底圆角 + 轻阴影，悬停微浮起 */
+.card {
+    border: 1px solid #e3e8ee;
+    border-radius: 8px;
+    box-shadow: 0 1px 4px rgba(20, 30, 45, 0.06);
+    background: #fff;
+    transition: box-shadow .18s ease;
+}
+.card:hover { box-shadow: 0 3px 12px rgba(20, 30, 45, 0.10); }
+.card-body { padding: 18px 20px; }
+#main { padding-top: 20px; padding-bottom: 46px; min-height: 62vh; }
+
+/* 表格：更清爽的头部与行分隔 */
+.header-torrents {
+    background-color: #f4f6f8 !important;
+    color: #7a8794;
+    letter-spacing: .4px;
+}
+.table-striped tbody tr:nth-of-type(odd) { background-color: #fafbfc; }
+.table > :not(caption) > * > * { padding: 6px 8px; }
+
+/* 按钮统一微调 */
+.btn { border-radius: 5px; }
+.btn-light {
+    background: #f4f6f8;
+    border-color: #dde3e9;
+    color: #44505e;
+}
+.btn-light:hover { background: #e9edf1; border-color: #cfd6de; }
+.btn-success { background-color: #2e8b57; border-color: #2e8b57; }
+.btn-success:hover { background-color: #277a4c; border-color: #277a4c; }
+.btn-primary { background-color: #2f7bcf; border-color: #2f7bcf; }
+
+/* 页脚：深色正式化 */
+.site-footer {
+    margin-top: 30px;
+    background: #232a33;
+    border-top: 3px solid #2e8b57;
+    padding: 26px 0 20px;
+    text-align: center;
+}
+.site-footer .footer-links { margin-bottom: 10px; }
+.site-footer .footer-links a {
+    color: #aeb9c5;
+    font-size: 12.5px;
+    margin: 0 10px;
+    text-decoration: none;
+}
+.site-footer .footer-links a:hover { color: #ffffff; text-decoration: underline; }
+.site-footer .footer-tagline { color: #6f7d8c; font-size: 12px; margin-bottom: 4px; }
+.site-footer .footer-copy { color: #55616e; font-size: 11px; }
+
+/* 统计页大数字更醒目 */
+.usePercent { color: #237a4a; font-size: 2.1em; }
+
+/* 徽章统一 */
+.badge { border-radius: 4px; font-weight: 600; }
+
+/* 响应式微调 */
+@media (max-width: 991px) {
+    .nav-search { margin: 10px 0; width: 100%; }
+    .nav-search .form-control-sm { flex: 1; width: auto; }
+}

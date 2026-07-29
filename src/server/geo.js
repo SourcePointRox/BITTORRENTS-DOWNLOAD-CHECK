@@ -83,7 +83,35 @@ let flushing = false;
 const BATCH_SIZE = 100;       // ip-api.com 批量上限
 const REFRESH_INTERVAL = 30 * 24 * 3600 * 1000; // 30 天刷新
 
-/* ---- ip-api.com 批量查询 ---- */
+/* ---- 多解析服务聚合：主批量源 + 多个备用单查源，熔断轮换 ----
+   任何一个 GeoIP 免费服务都可能限流/宕机/被墙，单一来源会导致解析服务不稳定。
+   策略：
+   1. 主源 ip-api.com 批量（100 IP/请求，最省配额）；
+   2. 主源失败/限流 → 备用源逐个单查轮换（freeipapi → ipwho.is → ipapi.co）；
+   3. 每源独立熔断器：连续失败 3 次冷却 10 分钟，自动恢复；
+   4. 解析结果跨源归一化为统一字段格式。 */
+const providerHealth = {
+  'ip-api': { fails: 0, cooldownUntil: 0, ok: 0, fail: 0 },
+  'freeipapi': { fails: 0, cooldownUntil: 0, ok: 0, fail: 0 },
+  'ipwhois': { fails: 0, cooldownUntil: 0, ok: 0, fail: 0 },
+  'ipapico': { fails: 0, cooldownUntil: 0, ok: 0, fail: 0 },
+};
+const PROVIDER_COOLDOWN = 10 * 60 * 1000;
+
+function provAvailable(name) {
+  return providerHealth[name].cooldownUntil < Date.now();
+}
+function provOk(name) {
+  const h = providerHealth[name];
+  h.fails = 0; h.ok++;
+}
+function provFail(name) {
+  const h = providerHealth[name];
+  h.fails++; h.fail++;
+  if (h.fails >= 3) { h.cooldownUntil = Date.now() + PROVIDER_COOLDOWN; h.fails = 0; }
+}
+
+/* ---- ip-api.com 批量查询（主源） ---- */
 async function batchResolve(ips) {
   if (!ips.length) return [];
   const url = 'http://ip-api.com/batch?fields=status,query,continent,country,countryCode,regionName,city,lat,lon,timezone,isp&lang=zh';
@@ -97,13 +125,89 @@ async function batchResolve(ips) {
       signal: ctrl.signal,
     });
     clearTimeout(timer);
-    if (!res.ok) return [];
+    if (!res.ok) { provFail('ip-api'); return null; }
     const data = await res.json();
-    if (!Array.isArray(data)) return [];
+    if (!Array.isArray(data)) { provFail('ip-api'); return null; }
+    provOk('ip-api');
     return data.filter(r => r.status === 'success');
   } catch (_) {
-    return [];
+    provFail('ip-api');
+    return null;
   }
+}
+
+/* ---- 备用源单查实现（统一映射为 ip-api 兼容结构） ---- */
+async function singleFetch(url, timeout = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'ikwyd-geo/2.0' } });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_) { return null; }
+  finally { clearTimeout(timer); }
+}
+
+const SINGLE_PROVIDERS = [
+  {
+    name: 'freeipapi',
+    url: (ip) => `https://freeipapi.com/api/json/${ip}`,
+    map: (r) => (r && r.countryCode) ? {
+      status: 'success', query: r.ipAddress, continent: r.continent || '',
+      country: r.countryName || 'Unknown', countryCode: r.countryCode,
+      regionName: r.regionName || '', city: r.cityName || '',
+      lat: r.latitude || 0, lon: r.longitude || 0,
+      timezone: (r.timeZones && r.timeZones[0]) || '', isp: '',
+    } : null,
+  },
+  {
+    name: 'ipwhois',
+    url: (ip) => `https://ipwho.is/${ip}?lang=zh-CN`,
+    map: (r) => (r && r.success !== false && r.country_code) ? {
+      status: 'success', query: r.ip, continent: r.continent || '',
+      country: r.country || 'Unknown', countryCode: r.country_code,
+      regionName: r.region || '', city: r.city || '',
+      lat: r.latitude || 0, lon: r.longitude || 0,
+      timezone: (r.timezone && r.timezone.id) || '',
+      isp: (r.connection && r.connection.isp) || '',
+    } : null,
+  },
+  {
+    name: 'ipapico',
+    url: (ip) => `https://ipapi.co/${ip}/json/`,
+    map: (r) => (r && r.country_code && !r.error) ? {
+      status: 'success', query: r.ip, continent: r.continent_code || '',
+      country: r.country_name || 'Unknown', countryCode: r.country_code,
+      regionName: r.region || '', city: r.city || '',
+      lat: r.latitude || 0, lon: r.longitude || 0,
+      timezone: r.timezone || '', isp: r.org || '',
+    } : null,
+  },
+];
+
+/* 备用源轮换单查一批 IP（并发 5），返回映射成功的结果数组 */
+async function fallbackResolve(ips) {
+  const out = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < ips.length) {
+      const ip = ips[cursor++];
+      let resolved = null;
+      for (const p of SINGLE_PROVIDERS) {
+        if (!provAvailable(p.name)) continue;
+        const raw = await singleFetch(p.url(ip));
+        if (raw == null) { provFail(p.name); continue; }
+        const mapped = p.map(raw);
+        if (mapped) { provOk(p.name); resolved = mapped; break; }
+        else provFail(p.name);
+      }
+      if (resolved) out.push(resolved);
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < 5; i++) workers.push(worker());
+  await Promise.allSettled(workers);
+  return out;
 }
 
 /* 将 API 返回映射为内部格式。
@@ -135,13 +239,21 @@ function storeResult(g) {
   memCache.set(g.ip, { ...g, _pending: false });
 }
 
-/* 执行一次批量查询（从 pendingQueue 取最多 BATCH_SIZE 个） */
+/* 执行一次批量查询（从 pendingQueue 取最多 BATCH_SIZE 个）。
+   主源批量失败/不可用时自动切换到备用源轮换，保证解析服务整体稳定。 */
 async function flushPending() {
   if (flushing || pendingQueue.size === 0) return;
   flushing = true;
   const batch = [...pendingQueue].slice(0, BATCH_SIZE);
   for (const ip of batch) pendingQueue.delete(ip);
-  const results = await batchResolve(batch);
+  let results = null;
+  if (provAvailable('ip-api')) {
+    results = await batchResolve(batch);
+  }
+  if (results == null) {
+    // 主源失败 → 备用源聚合单查
+    results = await fallbackResolve(batch);
+  }
   for (const r of results) storeResult(mapApiResult(r));
   flushing = false;
   // 如果队列还有积压，继续处理
@@ -214,5 +326,11 @@ module.exports = {
   lookup, populationOf, penetrationOf, allCountries, countryName,
   flushPending, refresh, isPrivateIp, backfillCountryDaily,
   /* 暴露内部状态用于监控 */
-  _stats: () => ({ pending: pendingQueue.size, cached: memCache.size, flushing }),
+  _stats: () => ({
+    pending: pendingQueue.size, cached: memCache.size, flushing,
+    providers: Object.fromEntries(Object.entries(providerHealth).map(([k, h]) => [k, {
+      available: h.cooldownUntil < Date.now(), ok: h.ok, fail: h.fail,
+      cooldownSec: Math.max(0, Math.round((h.cooldownUntil - Date.now()) / 1000)),
+    }])),
+  }),
 };

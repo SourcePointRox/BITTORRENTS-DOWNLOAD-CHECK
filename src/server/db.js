@@ -193,6 +193,8 @@ CREATE INDEX IF NOT EXISTS idx_torrents_v2 ON torrents(infohash_v2) WHERE infoha
 CREATE INDEX IF NOT EXISTS idx_peers_lastseen ON peers(last_seen);
 CREATE INDEX IF NOT EXISTS idx_obs_hash ON observations(infohash);
 CREATE INDEX IF NOT EXISTS idx_obslog_hash_ts ON obs_log(infohash, ts);
+CREATE INDEX IF NOT EXISTS idx_obslog_ts ON obs_log(ts);
+CREATE INDEX IF NOT EXISTS idx_obslog_ts_source ON obs_log(ts, source);
 `;
 
 let db = null;

@@ -1,13 +1,17 @@
 'use strict';
-/* 采集服务：运行在站点进程内，统一调度 模拟源 / 真实 DHT / Tracker / PEX，
+/* 采集服务：运行在站点进程内，统一调度 模拟源 / 真实 DHT 集群 / Tracker / PEX / 爬虫 / WebSeed，
    维护运行状态与统计，供后台监控 WEBUI 展示。
-   集成：冷存储同步、动态 Tracker 健康检查、pipeline 写队列。 */
+   集成：冷存储同步、动态 Tracker 健康检查、pipeline 写队列、
+        元数据聚合补全（meta-search）、cross-infohash swarm merge（crawler）。 */
 const db = require('../server/db');
 const pipeline = require('./pipeline');
-const { DHTSpider } = require('./dht');
+const { DHTCluster } = require('./dht');
 const tracker = require('./tracker');
 const metadata = require('./metadata');
 const pex = require('./pex');
+const metaSearch = require('./meta-search');
+const webseed = require('./webseed');
+const { SwarmCrawler } = require('./crawler');
 const geo = require('../server/geo');
 const { randomHex } = require('../common/util');
 
@@ -17,7 +21,8 @@ class CollectorService {
   constructor() {
     this.mode = 'off';            // off | sim | live
     this.startedAt = null;
-    this.spider = null;           // live 模式的 DHTSpider
+    this.cluster = null;          // live 模式的 DHTCluster（多端口并发）
+    this.crawler = null;          // 全局爬虫聚合器
     this.simTimer = null;
     this.simIps = [];
     this.trackerTimer = null;
@@ -25,8 +30,10 @@ class CollectorService {
     this.coldStorage = null;      // 冷存储同步
     this.metaQueue = [];
     this.metaWorking = 0;
+    this.trackerHarvestQueue = []; // crawler 发现的待收割 infohash
     this.ring = [];               // 最近事件环形缓冲 {ts,ip,infohash,source}
-    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0 };
+    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, metaEnriched: 0 };
+    this.dhtInstances = 3;
   }
 
   /* ---------- 模式控制 ---------- */
@@ -34,7 +41,7 @@ class CollectorService {
     this.stop();
     this.mode = 'sim';
     this.startedAt = Date.now();
-    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0 };
+    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, metaEnriched: 0 };
     pipeline.startPipeline();
     this.simIps = Array.from({ length: opts.ipPool || 2000 }, () => randomPublicIp());
     const intervalMs = opts.intervalMs || 2000;
@@ -69,10 +76,13 @@ class CollectorService {
     this.stop();
     this.mode = 'live';
     this.startedAt = Date.now();
-    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, pexPeers: 0, trackerPeers: 0, ipv6Peers: 0 };
+    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, metaEnriched: 0, pexPeers: 0, trackerPeers: 0, ipv6Peers: 0 };
     pipeline.startPipeline();
-    pipeline.setMetadataCallback((ih) => this._queueMeta(ih));
-    this.spider = new DHTSpider({
+    pipeline.setMetadataCallback((ih) => { this.counters.newTorrents++; this._queueMeta(ih); });
+
+    // DHT 集群：多端口并发（默认 3 实例），每实例独立端口预检 + 双栈引导
+    this.dhtInstances = opts.dhtInstances || 3;
+    this.cluster = new DHTCluster({
       port: opts.dhtPort || 6881,
       onObservation: (ev) => this._ingest(ev),
       onInfohash: (ih) => { if (pipeline.registerInfohash(ih)) this.counters.newTorrents++; },
@@ -82,7 +92,19 @@ class CollectorService {
         } catch (_) { return []; }
       },
     });
-    this.spider.start();
+    this.cluster.start(this.dhtInstances).catch(e => console.log('[dht-cluster] 启动异常:', e.message));
+
+    // 全局爬虫聚合器（DHT 全生态采集 + cross-infohash swarm merge）
+    this.crawler = new SwarmCrawler({
+      cluster: this.cluster,
+      onObservation: (ev) => this._ingest(ev),
+      onInfohash: (ih) => { if (pipeline.registerInfohash(ih)) this.counters.newTorrents++; },
+      onTrackerHarvest: (ih) => {
+        if (this.trackerHarvestQueue.length < 50) this.trackerHarvestQueue.push(ih);
+      },
+    });
+    this.crawler.start();
+
     // 动态 Tracker 管理器
     if (opts.tracker) {
       this.trackerMgr = new tracker.TrackerManager();
@@ -98,6 +120,10 @@ class CollectorService {
       this.retryTimer = setInterval(() => this._retryMeta(), 10000);
       this.retryTimer.unref && this.retryTimer.unref();
     }
+    // WebSeed 采集轮询（BEP-19 长效 HTTP 源探测 + 内容采样修正分类）
+    this.webseedTimer = setInterval(() => webseed.runRound(4).catch(() => {}), 90000);
+    this.webseedTimer.unref && this.webseedTimer.unref();
+
     this.geoFlushTimer = setInterval(() => geo.flushPending(), 5000);
     this.geoFlushTimer.unref && this.geoFlushTimer.unref();
     this.geoRefreshTimer = setInterval(() => geo.refresh(), 2 * 3600 * 1000);
@@ -113,12 +139,15 @@ class CollectorService {
     if (this.trackerTimer) { clearInterval(this.trackerTimer); this.trackerTimer = null; }
     if (this.pexTimer) { clearInterval(this.pexTimer); this.pexTimer = null; }
     if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
+    if (this.webseedTimer) { clearInterval(this.webseedTimer); this.webseedTimer = null; }
     if (this.geoFlushTimer) { clearInterval(this.geoFlushTimer); this.geoFlushTimer = null; }
     if (this.geoRefreshTimer) { clearInterval(this.geoRefreshTimer); this.geoRefreshTimer = null; }
     if (this.geoBackfillTimer) { clearInterval(this.geoBackfillTimer); this.geoBackfillTimer = null; }
+    if (this._enrichTimer) { clearInterval(this._enrichTimer); this._enrichTimer = null; }
     if (this.trackerMgr) { this.trackerMgr.stop(); this.trackerMgr = null; }
     if (this.coldStorage) { this.coldStorage.stop(); this.coldStorage = null; }
-    if (this.spider) { this.spider.stop(); this.spider = null; }
+    if (this.crawler) { this.crawler.stop(); this.crawler = null; }
+    if (this.cluster) { this.cluster.stop(); this.cluster = null; }
     this.mode = 'off';
     this.startedAt = null;
     return { mode: this.mode };
@@ -146,19 +175,25 @@ class CollectorService {
   }
 
   _queueMeta(infohash) {
-    this.counters.newTorrents++;
-    if (this.metaQueue.length > 200 || this.metaWorking > 3) return;
+    if (this.metaQueue.length > 400 || this.metaWorking > 5) return;
     this.metaQueue.push(infohash);
     this._pumpMeta();
   }
 
   async _pumpMeta() {
-    if (this.metaWorking > 3) return;
+    if (this.metaWorking > 5) return;
     const ih = this.metaQueue.shift();
     if (!ih) return;
     this.metaWorking++;
     try {
-      const rows = db.get().prepare('SELECT ip,port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 20').all(ih);
+      const rows = db.get().prepare('SELECT ip,port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 40').all(ih);
+      if (!rows.length) {
+        // 无任何可连接 peer 的 hash（sample 噪声）：不计失败，直接走聚合补全（限流）
+        this.metaWorking--;
+        this._enrichMetaThrottled(ih).catch(() => {});
+        if (this.metaQueue.length) this._pumpMeta();
+        return;
+      }
       const m = await metadata.resolveAndStore(ih, rows);
       if (m) {
         this.counters.metaResolved++;
@@ -167,16 +202,93 @@ class CollectorService {
           pipeline.registerInfohash(m.infohash_v2);
           this.counters.newTorrents++;
         }
+        // cross-infohash swarm merge：注册内容签名，发现 sibling swarm
+        if (this.crawler && m.name && m.size) {
+          const siblings = this.crawler.registerSignature(m.infohash || ih, m.name, m.size);
+          if (siblings.length) this._mergeSiblings(ih, siblings);
+        }
       } else {
+        // ut_metadata 失败 → 多 BT 站聚合搜索补全元数据（name/size/category）
         this.counters.metaFailed++;
+        this._enrichMetaThrottled(ih).catch(() => {});
       }
     } catch (_) { this.counters.metaFailed++; }
     this.metaWorking--;
     if (this.metaQueue.length) this._pumpMeta();
   }
 
+  /* 聚合补全限流：单独队列 + 令牌桶（~25 个/分钟），防止外网请求风暴 */
+  _enrichMetaThrottled(infohash) {
+    if (!this._enrichQueue) {
+      this._enrichQueue = [];
+      this._enrichSet = new Set();
+      this._enrichTimer = setInterval(() => this._pumpEnrich(), 2400); // 25/min
+      this._enrichTimer.unref && this._enrichTimer.unref();
+    }
+    if (this._enrichSet.has(infohash)) return Promise.resolve(false);
+    if (this._enrichQueue.length >= 300) return Promise.resolve(false); // 背压：队列满丢弃
+    this._enrichSet.add(infohash);
+    this._enrichQueue.push(infohash);
+    return Promise.resolve(true);
+  }
+
+  async _pumpEnrich() {
+    if (!this._enrichQueue || !this._enrichQueue.length) return;
+    const ih = this._enrichQueue.shift();
+    this._enrichSet.delete(ih);
+    // 只对"网络中真实活跃"（≥2 条观测）的 hash 消耗外部索引配额，
+    // sample 噪声 hash（0-1 条观测）不值得查询（命中率极低且浪费配额）
+    try {
+      const c = db.get().prepare('SELECT COUNT(*) AS c FROM obs_log WHERE infohash=?').get(ih).c;
+      if (c < 2) return;
+    } catch (_) { return; }
+    await this._enrichMeta(ih);
+  }
+
+  /* 多 BT 站聚合搜索补全：ut_metadata 拿不到时按 infohash 查开放种子库 */
+  async _enrichMeta(infohash) {
+    try {
+      const data = await metaSearch.enrich(infohash);
+      if (!data || !data.name) return;
+      this.counters.metaEnriched++;
+      // 补全入库：metadata_ok 保持 0（未经哈希校验），name/size/category 填充
+      pipeline.upsertTorrentMeta({
+        infohash,
+        hash_version: infohash.length === 64 ? 2 : 1,
+        name: data.name,
+        size: data.size || null,
+        category: data.category || 'Unsorted',
+        metadata_ok: 0,
+        first_seen: Date.now(), last_seen: Date.now(),
+      });
+      // knaben 等源返回的 magnetUrl 可能含 ws= WebSeed 声明
+      if (data.magnetUrl) {
+        const seeds = webseed.parseWebSeedsFromMagnet(data.magnetUrl);
+        if (seeds.length) webseed.registerWebSeeds(infohash, seeds);
+      }
+      // 内容签名注册（sibling swarm 发现）
+      if (this.crawler && data.name && data.size) {
+        const siblings = this.crawler.registerSignature(infohash, data.name, data.size);
+        if (siblings.length) this._mergeSiblings(infohash, siblings);
+      }
+    } catch (_) {}
+  }
+
+  /* sibling swarm 即时合并：A 的 peer 记录为 B 的观测（cross-infohash swarm merge） */
+  _mergeSiblings(infohash, siblings) {
+    try {
+      const peers = db.get().prepare('SELECT DISTINCT ip, port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 100').all(infohash);
+      if (!peers.length) return;
+      for (const dst of siblings.slice(0, 4)) {
+        for (const p of peers.slice(0, 50)) {
+          this._ingest({ ip: p.ip, port: p.port, infohash: dst, source: 'swarm_merge', ts: Date.now() });
+        }
+      }
+    } catch (_) {}
+  }
+
   _retryMeta() {
-    if (this.metaWorking > 3) return;
+    if (this.metaWorking > 5) return;
     const d = db.get();
     const row = d.prepare(`
       SELECT t.infohash, COUNT(o.id) AS pc,
@@ -192,12 +304,30 @@ class CollectorService {
     this._pumpMeta();
   }
 
+  /* Tracker 收割：热门种子 + crawler 采样发现的种子一起收割。
+     hybrid / v2 种子同时收割 v1 和 v2 两个 swarm 视角（双通道）。
+     tracker 返回的 peer 是“当前在线”的新鲜 peer（远好于 DHT 陈旧记录），
+     收割到足量 peer 的 hash 立即送入元数据队列（ut_metadata 成功率显著提升）。 */
   async _harvestSome() {
-    const rows = db.get().prepare('SELECT infohash FROM torrents ORDER BY last_seen DESC LIMIT 8').all();
+    const d = db.get();
+    const rows = d.prepare('SELECT infohash, infohash_v2, hash_version FROM torrents ORDER BY last_seen DESC LIMIT 8').all();
+    // crawler 通过 sample_infohashes 发现的待收割 hash 优先处理
+    const extra = this.trackerHarvestQueue.splice(0, 4);
+    for (const ih of extra) rows.unshift({ infohash: ih, infohash_v2: null, hash_version: 1 });
     for (const r of rows) {
       try {
         const found = await tracker.harvest(r.infohash, (ev) => this._ingest(ev));
-        this.counters.trackerPeers = (this.counters.trackerPeers || 0) + (typeof found === 'number' ? found : (found.peers || 0));
+        const peerN = typeof found === 'number' ? found : (found.peers || 0);
+        this.counters.trackerPeers = (this.counters.trackerPeers || 0) + peerN;
+        // 新鲜 peer 直通：收割到 ≥3 个 peer 的 hash 优先解析元数据
+        if (peerN >= 3) this._queueMeta(r.infohash);
+        // hybrid：同时收割 v2 swarm（HTTP tracker 用 32 字节 v2 announce；UDP 自动截断）
+        if (r.hash_version === 3 && r.infohash_v2) {
+          const found2 = await tracker.harvest(r.infohash_v2, (ev) => this._ingest(ev));
+          const peerN2 = typeof found2 === 'number' ? found2 : (found2.peers || 0);
+          this.counters.trackerPeers = (this.counters.trackerPeers || 0) + peerN2;
+          if (peerN2 >= 3) this._queueMeta(r.infohash_v2);
+        }
       } catch (_) {}
     }
   }
@@ -211,9 +341,9 @@ class CollectorService {
     `).all(Date.now() - 600000);
     for (const r of rows) {
       try {
-        const peers = d.prepare('SELECT ip, port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 20').all(r.infohash);
+        const peers = d.prepare('SELECT ip, port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 24').all(r.infohash);
         if (!peers.length) continue;
-        const discovered = await pex.harvest(r.infohash, peers, (ev) => this._ingest(ev));
+        const discovered = await pex.harvest(r.infohash, peers, (ev) => this._ingest(ev), { concurrency: 6, maxSeeds: 16 });
         this.counters.pexPeers = (this.counters.pexPeers || 0) + discovered.length;
       } catch (_) {}
     }
@@ -246,8 +376,8 @@ class CollectorService {
   getStats() {
     const now = Date.now();
     const ratePerMin = this.ring.filter(e => now - e.ts < 60000).length;
-    const s = this.spider ? this.spider.stats : null;
-    const dhtNodes = this.spider ? this.spider.routing.size() : 0;
+    const dhtRunning = !!(this.cluster && this.cluster.instances.length);
+    const dhtAgg = this.cluster ? this.cluster.stats : null;
     return {
       mode: this.mode,
       startedAt: this.startedAt,
@@ -262,21 +392,31 @@ class CollectorService {
       ratePerMin,
       counters: this.counters,
       metaQueue: this.metaQueue.length,
-      dht: this.spider ? {
-        running: true, nodes: dhtNodes, port: this.spider.port,
-        rx: s.rx, tx: s.tx, peers: s.peers, announces: s.announces,
-        samples: s.samples, ipv6Peers: s.ipv6Peers, utpPeers: s.utpPeers || 0,
-      } : { running: false, nodes: 0, port: 6881, rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0, utpPeers: 0 },
+      dht: dhtRunning ? {
+        running: true,
+        nodes: this.cluster.nodes,
+        nodes6: this.cluster.nodes6,
+        port: this.cluster.port,
+        ports: this.cluster.ports,
+        instances: this.cluster.instances.length,
+        hasV6: this.cluster.hasV6,
+        rx: dhtAgg.rx, tx: dhtAgg.tx, peers: dhtAgg.peers, announces: dhtAgg.announces,
+        samples: dhtAgg.samples, ipv6Peers: dhtAgg.ipv6Peers, utpPeers: dhtAgg.utpPeers || 0,
+      } : { running: false, nodes: 0, nodes6: 0, port: 6881, ports: [], instances: 0, hasV6: false, rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0, utpPeers: 0 },
       tracker: this.trackerMgr ? this.trackerMgr.getStats() : null,
+      crawler: this.crawler ? this.crawler.getStats() : null,
+      webseed: webseed.getStats(),
+      metaSearch: metaSearch.getStats(),
+      geo: geo._stats(),
       coldStorage: this.coldStorage ? this.coldStorage.getStats() : null,
       recent: this.ring.slice(-30).reverse(),
     };
   }
 
   getNodes() {
-    if (!this.spider) return { nodes: [] };
+    if (!this.cluster || !this.cluster.instances.length) return { nodes: [] };
     const now = Date.now();
-    const nodes = this.spider.routing.values()
+    const nodes = this.cluster.allNodes()
       .sort((a, b) => b.lastSeen - a.lastSeen)
       .slice(0, 100)
       .map(n => ({
@@ -286,6 +426,12 @@ class CollectorService {
         ageSec: Math.floor((now - n.lastSeen) / 1000),
       }));
     return { nodes };
+  }
+
+  /* 全量 tracker 详情（监控 WebUI 滚轮查看全部） */
+  getTrackerList() {
+    if (!this.trackerMgr) return [];
+    return this.trackerMgr.getAllTrackers();
   }
 }
 

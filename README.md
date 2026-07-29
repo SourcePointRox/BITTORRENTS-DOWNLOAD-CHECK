@@ -1,26 +1,31 @@
 # BITTORRENTS-DOWNLOAD-CHECK
 
-BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 DHT / PEX / Tracker / P2P 网络，实时监控与采集种子元数据，**全链路 IPv6 支持 + BitTorrent v2 (BEP-52) + 标准 Kademlia K-bucket 路由 + 动态 Tracker 健康检查 + 独立冷存储进程 + 协议加密 (MSE/PE) + uTP (BEP-29) 检测 + TF-IDF + Softmax 分类器**。
+BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 DHT / PEX / Tracker / WebSeed / P2P 网络，实时监控与采集种子元数据，**DHT 多端口集群 + 全链路 IPv6 双栈 + BitTorrent v2 (BEP-52) + 万级动态 Tracker 池 + 全局爬虫聚合 + cross-infohash swarm merge + 多源 GeoIP 聚合 + 多 BT 站元数据聚合补全 + MSE/PE 协议加密 + TF-IDF + Softmax 分类器**。
 
 零第三方依赖（Node.js ≥ 22.5 标准库 + 内置 `node:sqlite`），可离线启动。
 
 ## 功能概览
 
-- **全网络采集**：DHT (BEP-5/51/52) + PEX (BEP-11) + Tracker (HTTP/UDP, BEP-3/15/7) + BitTorrent P2P (BEP-9/10)
-- **IPv6 全链路**：DHT 双栈 UDP 监听 + PEX `added6` 解析 + Tracker `peers6` (BEP-7) + 元数据 TCP v6 连接
-- **BitTorrent v2 (BEP-52)**：SHA-256 infohash / 64-hex / multihash `btmh` 磁链 / file tree / piece layers / hybrid 混合种子
+- **全网络采集**：DHT (BEP-5/32/51/52) + PEX (BEP-11) + Tracker (HTTP/UDP, BEP-3/15/7) + WebSeed (BEP-19) + BitTorrent P2P (BEP-9/10)
+- **DHT 多端口集群**：默认 3 实例并发（独立端口/节点 ID/路由表），启动前 UDP 端口预检自动换端口，单点端口阻塞不再停摆；双栈独立引导（IPv4 DHT + IPv6 DHT 各自建网）
+- **IPv6 全链路**：DHT 双栈 UDP 监听 + AAAA 引导 + `want=[n4,n6]` + PEX `added6` 解析 + Tracker `peers6` (BEP-7) + 元数据 TCP v6 连接
+- **BitTorrent v2 (BEP-52)**：SHA-256 infohash / 64-hex / multihash `btmh` 磁链 / file tree / piece layers / hybrid 混合种子 / HTTP tracker 32 字节 v2 announce / v1↔v2 双通道收割
+- **全局爬虫聚合器**：find_node trawl 扩路由 + BEP-51 高频采样 + 主动 announce 吸引反向观测 + get_peers 被动观测（查询者即下载者）
+- **cross-infohash swarm merge**：内容签名（归一化 name+size）相同的 sibling swarm 自动合并 peer 池；hybrid v1/v2 观测双向合并
+- **WebSeed (BEP-19)**：解析 magnet `ws=` 声明注册长效 HTTP 源，HEAD 活性探测 + Range 512KB 内容采样 + 魔数（magic bytes）自动修正分类
+- **万级动态 Tracker 池**：50+ 个每日自动更新列表源（newTrackon 实时 API ×5 + ngosang/XIU2/DeSireFire/adysec/hezhijie0327 全系列 + CDN 镜像 + HTML 页面源），URL 级去重后约 4000+ 端点（容量 10000），120 并发全量健康检查（不截断），存活优先排序，死亡降频复查
+- **多 BT 站元数据聚合补全**：ut_metadata 失败时按 infohash 聚合查询 SolidTorrents / Knaben / apibay(TPB) / torrentz2 / BT4G，熔断轮换 + 7 天缓存 + 令牌桶限流，补全 name/size/category
+- **多源 GeoIP 聚合**：ip-api.com 批量主源 + freeipapi/ipwho.is/ipapi.co 备用源熔断轮换，单源宕机/限流不中断解析
 - **协议加密 (MSE/PE, BEP-8)**：纯 JS RC4 + 768-bit DH 密钥交换，连接要求加密的 peer，握手失败自动回退明文
-- **uTP 检测 (BEP-29)**：通过 DHT `announce_peer` 的 `implied_port` 标志识别 uTP peer，统计监控面板可见
+- **uTP 检测 (BEP-29)**：通过 DHT `announce_peer` 的 `implied_port` 标志识别 uTP peer（端口语义已修正：implied_port 不再误作 BT TCP 端口）
 - **TF-IDF + Softmax 分类器**：替代纯正则规则，多项逻辑回归 + 混合策略（正则硬规则优先 + ML 处理其余），8 类自动分类
 - **标准 Kademlia 路由**：160 桶 × K=8 LRU 路由表（替代平面 Map），节点 ID 周期性刷新扩大覆盖
-- **动态 Tracker 管理**：全网聚合多个实时更新源（newTrackon 实时存活 API + ngosang/XIU2/DeSireFire/adysec 等每日列表 + CDN 镜像回退），按主机去重后约 1000+ 个，5 分钟健康检查 + 3 次失败剔除
 - **独立冷存储进程**：分离进程转存种子元数据到独立 SQLite（仅 name/size/magnet/v1/v2），主进程状态可查
-- **真实 GeoIP**：基于 ip-api.com 批量查询（中文返回），内存+DB 双层缓存，30 天自动刷新，批量补写 country_daily
-- **元数据解析**：BT 握手（置 BEP-52 v2 位）→ ut_metadata 拉取 info 字典 → SHA-1/SHA-256 校验 → 自动分类，并行 20 peer + 重试
-- **长跑稳定**：TTL 化去重 Map（25h 过期）+ obs_log 30 天 TTL + 写队列批处理（500ms / 50 条）+ WAL 模式
-- **Web 站点**：完整复刻 iknowwhatyoudownload.com 全站功能，daily statistics 默认 "Global" 视图
+- **元数据解析**：BT 握手（置 BEP-52 v2 位）→ ut_metadata 拉取 info 字典 → SHA-1/SHA-256 校验 → 自动分类，并行 40 peer + 重试 + 聚合补全兜底
+- **长跑稳定**：TTL 化去重 Map（25h 过期）+ obs_log 30 天 TTL + 写队列批处理（500ms / 50 条）+ WAL 模式 + obs_log ts 复合索引
+- **Web 站点**：完整复刻 iknowwhatyoudownload.com 全站功能，正式化 UI（修复 logo 裁剪、导航/按钮比例、卡片阴影、深色页脚）
 - **REST API**：对齐官方 Peer/Torrent/Content API，免 Key 沙箱模式
-- **监控 WebUI**：独立端口，多来源堆叠图表（平滑过渡）、IPv6/v2/冷存储/Tracker 健康度面板、健康度评估、系统资源趋势
+- **监控 WebUI**：独立端口，分步加载（轻量 stats / 重量 charts / 全量 trackers 独立端点防卡死）、Top 国家扇形图、全量 tracker 滚动列表（存活在前）、GeoIP/聚合源健康面板、爬虫/WebSeed 统计
 - **自动端口检测**：默认端口被占用时自动切换到可用端口
 
 ## 快速开始
@@ -37,11 +42,11 @@ BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 
 # 模拟采集模式（默认，无需公网，生成演示数据）
 node scripts/start.js
 
-# 真实 DHT + PEX + Tracker 全网络采集（含 IPv6 + BEP-52 hybrid）
+# 真实 DHT 集群 + PEX + Tracker + 爬虫 + WebSeed 全网络采集（含 IPv6 + BEP-52 hybrid）
 node scripts/start.js --live
 
-# 指定端口 + DHT 端口
-node scripts/start.js --live --port 9000 --monitor-port 9090 --dht-port 6881
+# 指定端口 + DHT 起始端口 + DHT 集群实例数
+node scripts/start.js --live --port 9000 --monitor-port 9090 --dht-port 6881 --dht-instances 3
 
 # 仅启动站点（不启动采集器）
 node scripts/start.js --no-collector
@@ -68,8 +73,11 @@ Windows 下也可双击 `start.bat`。
 [start] ========================================
 [dht] listening on udp4 UDP 6881
 [dht] listening on udp6 UDP 6881        ← IPv6 双栈
+[dht] listening on udp4 UDP 7881        ← DHT 集群实例 2（多端口容错）
+[dht] listening on udp4 UDP 8881        ← DHT 集群实例 3
+[dht-cluster] 3 个实例运行中: UDP 6881, UDP 7881, UDP 8881
 [cold-storage] synced +1000 updated 0   ← 冷存储独立工作
-[ikwyd] collector: live DHT+PEX+Tracker mode
+[ikwyd] collector: live DHT-cluster+PEX+Tracker+Crawler+WebSeed mode
 [monitor] 监控 WebUI: http://localhost:9090/
 ```
 
@@ -509,6 +517,85 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 ---
 
 ## 更新日志
+
+### v0.6.0 — 2026-07-29
+
+> 大版本：万级 Tracker 池 + DHT 多端口集群 + IPv6 双栈引导修复 + 全局爬虫聚合 + WebSeed + 多 BT 站元数据聚合 + 多源 GeoIP + 双 WebUI 美化。
+
+#### 新增
+
+- **万级动态 Tracker 池（`tracker.js` 全面重写）**：
+  - **50+ 个每日自动更新列表源**：newTrackon 实时存活 API（all/stable/live/udp/http 5 个维度）；ngosang/trackerslist 全系列（all/ip/http/https/udp/best/best_ip）；XIU2/TrackersListCollection 全系列（all/best/http/nohttp/other）；DeSireFire/animeTrackerList **AT + ATline 双系列**（all/best/ip/udp/http/https）；adysec/tracker 全系列（all/best/best_http/best_https/best_udp，当前全网最大聚合源）；hezhijie0327/Trackerslist（tracker/combine/exclude）；CDN 镜像回退（jsDelivr 4 节点 / statically / cf.trackerslist.com / trackerslist.com）；HTML 页面源（torrenttrackerlist.com，正则提取 tracker URL）
+  - **URL 级去重**替代旧的主机名去重：同一主机的不同端口/路径/协议是独立服务端点，全部保留，池规模从 ~1000 提升至 **4000+ 唯一端点**（容量上限 10000，向五位数级别看齐；受全球公开 tracker 生态总量限制，当前各源合并去重后约 4000+）
+  - **全量健康检查（不截断）**：修复"只检查前 20 个 tracker"的缺陷——流式调度 120 并发 × 5s 超时，每一个 tracker 每轮都被探测；存活者优先复查（harvest 主力需要新鲜延迟），dead 条目降频复查（每 3 轮 1 次，保留复活机会）
+  - 监控 WebUI **全量 tracker 详情**：`/api/trackers` 独立端点返回全部条目，前端滚动列表 + URL 过滤 + 保留滚动位置；**存活在前（按延迟升序）、死亡在后**，不再只显示前 20 个
+
+- **DHT 多端口集群（`dht.js` 重构）**：
+  - **端口预检**：启动前用临时 socket 探测 UDP 端口占用（`canBindUdp`/`findFreeUdpPort`），被占自动递增换端口，"一旦端口阻塞就停止工作"成为历史
+  - **多端口并发**：`DHTCluster` 默认 3 实例（独立端口 base/base+1000/base+2000、独立节点 ID、独立路由表），任一实例可用即维持采集；`--dht-instances N` 可调
+  - 修复集群启动竞态：bind 异步导致实例被误判不可用（已等待 listening 后再入列）
+
+- **IPv6 双栈引导修复（采集量从 1 小时 4 个 → 75 秒 183 个）**：
+  - **根因**：旧版只对 udp4 做 bootstrap 且只用主机名（永远解析 A 记录），IPv6 DHT（BEP-32，与 IPv4 DHT 平行的独立网络）从未引导 → v6 路由为空 → v6 peer 趋近 0
+  - **修复**：udp4/udp6 各自独立引导（显式 `dns.lookup(all)`，A 记录走 v4、AAAA 记录走 v6）；查询携带 `want=[n4,n6]`（BEP-32）请求双栈节点；响应自适应解析 `nodes`(26B) / `nodes6`(38B)；v6 节点单独统计（监控面板可见 v6 路由数）
+  - Tracker HTTP announce 附带 `ipv6=1` 提示（BEP-7）鼓励返回 `peers6`
+
+- **全局爬虫聚合器（新模块 `crawler.js`）**：
+  - **find_node trawl**：100ms 周期对随机 target 查询，持续扩大路由覆盖（覆盖越广采样越全）
+  - **BEP-51 高频采样**：500ms 周期 `sample_infohashes` 随机 target，发现的新 infohash 即时注册并送入 tracker 收割队列
+  - **主动 announce**：60s 周期向最热 infohash 的 K 近邻节点宣告自身，吸引真实 leecher 反向连接（iknowwhatyoudownload 式被动采集）
+  - **get_peers 被动观测**（`dht.js`）：正在全网寻找某 infohash 的查询者即真实下载者，记录为 `dht_getpeers` 观测（port 记 null——那是 DHT 端口不是 BT 端口）
+  - **cross-infohash swarm merge**：内容签名（归一化 name+size）相同的种子视为 sibling swarm（重打包/混合 v1-v2/异 tracker 分片），peer 池自动互相合并（`swarm_merge` 来源）；全局稳定 peer（跨 3+ swarm 出现）优先作为元数据/PEX 连接候选
+
+- **WebSeed 采集器（新模块 `webseed.js`，BEP-19 GetRight）**：
+  - 从聚合搜索返回的 magnetUrl 解析 `ws=`/`xs=` 声明，注册长效 HTTP 源（等价于 BitComet 长效种子的 HTTP 缓存层）
+  - HEAD 活性探测（成功 → 标记种子 alive）+ HTTP Range 512KB 内容采样
+  - **魔数分类修正**：MKV/MP4/AVI/WMV（视频）、MP3/FLAC/OGG（音频）、PDF（书籍）、PE/ELF（软件）、RAR/ZIP 等 14 种签名自动识别，对 Unsorted 种子自动修正分类
+  - 工程化：并发闸 2、每 host 最小间隔 5s、超时 8s，不产生外网请求风暴
+
+- **多 BT 站元数据聚合补全（新模块 `meta-search.js`）**：
+  - ut_metadata 从 peer 拉取失败时，按 infohash 聚合查询开放种子库：**SolidTorrents API**（DHT 爬虫索引，多域名镜像）→ **Knaben Database API**（聚合 TPB/Nyaa/1337x 等）→ **apibay**（ThePirateBay 官方 API，多镜像）→ **torrentz2.nz**（元搜索聚合，HTML）→ **BT4G**（DHT 索引站，HTML）
+  - 每 provider 独立熔断器（连续失败 3 次冷却 10 分钟，自动恢复；实测 SolidTorrents 每日 200 次免费额度触发 429 后自动切换 Knaben）
+  - 7 天 DB+内存双层缓存（含负缓存）、全局并发闸 2、每源最小间隔 1.5s+抖动、令牌桶 25/min
+  - 只对"网络中真实活跃"（≥2 条观测）的 hash 消耗外部索引配额（sample 噪声不查）
+  - 补全结果 name/size/category 入库（`metadata_ok=0` 标记未经哈希校验），knaben magnetUrl 中的 `ws=` 自动注册为 WebSeed
+
+- **多源 GeoIP 聚合（`geo.js` 增强）**：
+  - 主源 ip-api.com 批量（100 IP/请求，中文）+ 备用源 **freeipapi.com / ipwho.is / ipapi.co** 单查轮换（并发 5）
+  - 每源独立熔断器（连续失败 3 次冷却 10 分钟），主源限流/宕机自动切换，解析服务不再单点
+  - 监控面板展示各源健康状态（✓/✗ 计数与冷却倒计时）
+
+- **BitTorrent v2 / hybrid 采集策略强化**：
+  - HTTP tracker 支持 **32 字节 v2 infohash announce**（BEP-52）；UDP tracker 自动截断 20 字节（BEP-15 固定字段）
+  - hybrid 种子 tracker 收割升级为**双通道**（v1 swarm + v2 swarm 同时收割）
+  - DHT 层面对 64-hex 统一截断（SHA-256 前 20 字节）；hybrid 元数据解析后自动互注册 v1↔v2 并合并观测（`linkHybridInfohash`）
+  - PEX/元数据握手均置 BEP-52 v2 支持位，v2 截断 hash 握手校验
+
+#### 修复
+
+- **PEX 长期 0 采集修复**：
+  - 串行 8 peer × 8s 超时（每轮最坏 64s，与 45s 调度叠加）→ **并行批量**（并发 6，最多 16 种子 peer）
+  - 仅明文握手 → **MSE/PE 加密优先**（qBittorrent/Transmission 默认 prefer-encrypt，大量 peer 拒绝明文），失败回退明文
+  - 从不发送 `interested` → 修复为扩展握手后立即发送（多数客户端只对 interested 连接推送 PEX 列表）
+  - 收到首条 PEX 立即断开 → **2.5s 收集窗口**持续收取增量推送
+- **implied_port 端口语义错误（严重）**：DHT `announce_peer` 带 `implied_port=1` 时把对方的 **DHT/UDP 端口**误记为 BT TCP 端口，后续元数据/PEX 拿 UDP 端口做 TCP 连接必然超时（实测 5/5 全 18s 超时）——修复为记 `null`（不进入 TCP 候选池），元数据候选质量显著提升
+- **metaFailed 计数失真**：对无任何可连接 peer 的 sample 噪声 hash 也计失败（45 秒虚增 6483 次）——修复为无 peer hash 静默走聚合通道不计失败，有 peer 但全失败才计数
+- **主站 logo 显示不全**：`logo.svg` viewBox 宽 110 而文字实际宽 ~137 → 文字被裁剪；重绘 logo（150×26，渐变图标 + 双色字标），导航栏垂直居中
+- **监控 WebUI 卡死风险**：原 `/api/stats` 单端点承担全部聚合 SQL（大 obs_log 上 2s 轮询直接拖垮）——拆分为 `/api/stats`（轻量计数器，2s）+ `/api/charts`（时间桶聚合，5s）+ `/api/trackers`（全量大表，10s）+ `/api/nodes`（10s），前端**分步加载**（0ms/300ms/800ms/1500ms 错峰首屏），大负荷与主流程脱离
+- **obs_log 缺 ts 索引**：监控图表 `WHERE ts >= ? GROUP BY ...` 全表扫描 —— 新增 `idx_obslog_ts` + `idx_obslog_ts_source` 复合索引
+
+#### 优化
+
+- **元数据连接策略**：单 peer 超时 12s → 8s（提高轮转），每 hash 候选 peer 20 → 40
+- **监控 WebUI 美化**：Top 国家改**扇形图**（doughnut + 图例 + 百分比）；新增 DHT 集群端口、v6 路由数、爬虫 trawl/合并、WebSeed 注册/修正、GeoIP 源健康、聚合源健康等信息密度面板；来源徽章新增 `dht_getpeers`/`swarm_merge`；表格吸顶表头、滚动条样式、卡片阴影与微交互
+- **主站 WebUI 正式化**：导航栏白底阴影 + 链接选中态；搜索框与按钮统一 32px 同高（比例协调）；卡片圆角阴影悬停浮起；表格斑马纹与头部浅灰；深色正式页脚（站点地图 + 技术栈声明 + 版权行）
+- **Tracker 健康检查间隔** 5min → 10min（万级池全量探测的合理节奏），远程列表刷新 24h → 12h
+
+#### 验证
+
+- 单元 30 + e2e 59 + admin 33（新增 charts/trackers 端点与排序断言）+ stress 18 = **140 项测试全部通过**
+- live 实测（百兆 NAT 网络，3 DHT 实例）：启动 75 秒采集 IPv6 peer **183 个**（旧版 1 小时 4 个）、速率 492 events/min、DHT 路由 300+（含 v6 节点 64-140）、tracker 池 3941 端点全量健康检查、metaFailed 计数恢复正常（8 次）
+- SolidTorrents 429 限流 → 熔断切换 Knaben 链路实测生效
 
 ### v0.5.2 — 2026-07-29
 

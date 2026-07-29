@@ -16,7 +16,7 @@ const PSTR = Buffer.from('BitTorrent protocol');
 const EXT_HANDSHAKE_ID = 0;
 const UT_METADATA_ID = 3; // 本地扩展 ID（对方可能不同，以握手为准）
 const BLOCK = 16 * 1024;
-const TIMEOUT = 12000;
+const TIMEOUT = 8000;
 
 /* 分类器：TF-IDF + 多项逻辑回归（Softmax），置信度不足回退正则规则。
    详见 classifier.js。懒训练、单例缓存，首调 <50ms。 */

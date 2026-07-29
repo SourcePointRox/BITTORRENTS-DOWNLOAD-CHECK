@@ -32,10 +32,10 @@ ${headExtra}</head>
         });
     });
 </script>
-<nav class="navbar navbar-expand-lg navbar-light bg-light" itemscope itemtype="http://www.schema.org/SiteNavigationElement">
+<nav class="navbar navbar-expand-lg navbar-light site-nav" itemscope itemtype="http://www.schema.org/SiteNavigationElement">
     <div class="container-fluid">
-        <a class="navbar-brand" href="/">
-            <img alt="Brand" src="/assets/img/logo.svg" width="110" height="24">
+        <a class="navbar-brand d-flex align-items-center" href="/">
+            <img alt="Brand" src="/assets/img/logo.svg" width="150" height="26">
         </a>
         <button type="button" class="navbar-toggler collapsed" data-bs-toggle="collapse" data-bs-target="#mainNavbar" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
@@ -49,9 +49,9 @@ ${headExtra}</head>
                 <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/api/">API</a></li>
                 <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/contacts/">About Us</a></li>
             </ul>
-            <form class="d-flex" role="search" action="/en/peer/">
-                <input type="text" class="form-control me-2" placeholder="127.0.0.1" name="ip">
-                <button type="submit" class="btn btn-light">Find IP</button>
+            <form class="d-flex nav-search" role="search" action="/en/peer/">
+                <input type="text" class="form-control form-control-sm" placeholder="127.0.0.1" name="ip">
+                <button type="submit" class="btn btn-success btn-sm">Find IP</button>
             </form>
             <ul class="navbar-nav ms-auto">
                 <li class="nav-item"><a class="nav-link" id="lang" href="#">RU</a></li>
@@ -63,18 +63,18 @@ ${headExtra}</head>
 ${content}
 </div>
 
-<footer class="footer" id="footer">
+<footer class="footer site-footer" id="footer">
     <div class="container">
-        <div class="row"></div>
-        <div class="row">
-            <div class="col-12">
-                <p>
-                <div class="col-md-12 text-center">
-                    <a class="twitter-follow-button" href="https://twitter.com/iknowtorrents" data-size="large">Follow Us</a>
-                </div>
-                </p>
-            </div>
+        <div class="footer-links">
+            <a href="/en/peer/">IP Info</a>
+            <a href="/en/link/">Track Downloads</a>
+            <a href="/en/stat/daily">Daily Statistics</a>
+            <a href="/en/stat/annual">Annual Statistics</a>
+            <a href="/en/api/">API</a>
+            <a href="/en/contacts/">About Us</a>
         </div>
+        <div class="footer-tagline">BitTorrent network metadata collector — DHT &middot; PEX &middot; Tracker &middot; WebSeed &middot; BEP-52</div>
+        <div class="footer-copy">Sandbox build for research &middot; Facts collected via public BitTorrent protocols</div>
     </div>
 </footer>
 ${bodyExtra}

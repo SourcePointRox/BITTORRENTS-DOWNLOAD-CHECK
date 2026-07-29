@@ -37,6 +37,7 @@ function parseArgs() {
     if (tok === '--port') { args.port = Number(next); i++; continue; }
     if (tok === '--monitor-port') { args.monitorPort = Number(next); i++; continue; }
     if (tok === '--dht-port') { args.dhtPort = Number(next); i++; continue; }
+    if (tok === '--dht-instances') { args.dhtInstances = Number(next); i++; continue; }
     if (tok.startsWith('--') && next && !next.startsWith('--')) {
       args[tok.slice(2)] = next; i++; continue;
     }
@@ -59,7 +60,8 @@ BITTORRENTS-DOWNLOAD-CHECK 一键启动
   --no-monitor          不启动独立监控 WebUI
   --port <n>           指定站点端口（默认 8080，被占用则自动切换）
   --monitor-port <n>    指定监控端口（默认 8090，被占用则自动切换）
-  --dht-port <n>        指定 DHT UDP 端口（默认 6881，仅 live 模式）
+  --dht-port <n>        指定 DHT UDP 起始端口（默认 6881，仅 live 模式；占用自动换端口）
+  --dht-instances <n>   DHT 集群并发实例数（默认 3，多端口容错，仅 live 模式）
   --seed                强制重新生成演示数据
   --help, -h            显示本帮助
 
@@ -195,6 +197,7 @@ async function main() {
   const siteServer = start(sitePort, {
     collector: collectorMode,
     dhtPort: Number(args.dhtPort) || 6881,
+    dhtInstances: Number(args.dhtInstances) || 3,
   });
 
   // 6. 启动独立监控 WebUI
