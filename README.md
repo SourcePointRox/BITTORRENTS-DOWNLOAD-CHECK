@@ -510,6 +510,32 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.5.1 — 2026-07-29
+
+#### 修复
+
+- **监控 WebUI 全面瘫痪修复（严重 bug）**：独立监控 WebUI（`monitor.js`）未提供 `/assets/*` 静态资源服务，导致 Chart.js (`/assets/js/chart.umd.min.js`) 返回 404，前端 JS 执行中断（`Chart is not defined`），所有面板（采集趋势曲线、来源分布、元数据解析进度、Top 国家、IPv6 统计、v2 统计、冷存储状态、Tracker 健康度、实时事件流、DHT 路由表、系统资源）全部无法渲染。
+  - **根因**：`monitor.js` 的 `handle()` 函数只处理 `/` 和 `/api/*` 路由，不处理 `/assets/*` 静态资源请求，而仪表盘 HTML 引用了 `/assets/js/chart.umd.min.js`
+  - **修复**：在 `handle()` 中添加静态资源服务，从 `public` 目录提供 `/assets/*` 文件（JS/CSS/字体/图片），含路径遍历防护和 MIME 类型映射
+  - **影响范围**：所有使用独立监控 WebUI 的场景（`start.js` 默认启动监控 WebUI 在 8090 端口）
+
+#### 新增
+
+- **24h 采集趋势查看**：趋势曲线时间窗口从最大 6h 扩展到 24h，新增 12h 和 24h 按钮
+  - 当时间窗口 > 6h 时自动切换为小时桶（3600000ms），避免分钟桶产生过多数据点（24h=1440 个分钟桶 → 24 个小时桶），图表清晰且查询性能更优
+  - x 轴标签自适应：小时桶显示 `MM/DD HH:00`，分钟桶显示 `HH:MM`
+  - 涉及 `perMinuteBuckets` 和 `perMinuteBySource` 两个函数的桶大小优化
+
+#### 测试
+
+- **新增 14 项监控 WebUI 回归测试**（`tests/admin.js` 第 5 段）：
+  - Chart.js 静态资源返回 200 + 正确 content-type + 内容非空（核心 bug 回归防护）
+  - 仪表盘含 24h 趋势按钮
+  - `/api/stats` 全面板数据完整性验证：perMinuteBySource / sources / topCountries / meta / meta.versions / ipv6 / system / health
+  - 24h 趋势返回小时桶（<=30 个点）
+  - `/api/nodes` 接口结构
+- 总测试数从 125 提升到 **139 项全通过**（30 unit + 59 e2e + 18 stress + 32 admin）
+
 ### v0.5.0 — 2026-07-29
 
 #### 新增

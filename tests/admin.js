@@ -80,6 +80,49 @@ async function main() {
   const nodes = await getJSON('/admin/api/nodes');
   ok('节点接口结构', nodes.status === 200 && Array.isArray(nodes.body.nodes));
 
+  console.log('== 5. 独立监控 WebUI（静态资源 + 全面板数据）==');
+  const monitor = require('../src/server/monitor');
+  const MONITOR_PORT = 18090;
+  monitor.init(getCollector(), PORT, MONITOR_PORT);
+  monitor.start(MONITOR_PORT);
+  await sleep(300);
+  const MB = `http://localhost:${MONITOR_PORT}`;
+
+  // 5.1 静态资源（Chart.js 等）—— 核心 bug 回归防护
+  const chartJs = await fetch(MB + '/assets/js/chart.umd.min.js');
+  ok('监控WebUI 提供 Chart.js 静态资源', chartJs.status === 200 && chartJs.headers.get('content-type').includes('javascript'),
+    `status=${chartJs.status} type=${chartJs.headers.get('content-type')}`);
+  const chartBody = await chartJs.text();
+  ok('Chart.js 内容非空', chartBody.length > 10000, `len=${chartBody.length}`);
+
+  // 5.2 仪表盘页面
+  const dashPage = await fetch(MB + '/');
+  ok('监控仪表盘 200', dashPage.status === 200);
+  const dashHtml = await dashPage.text();
+  ok('仪表盘含 24h 趋势按钮', dashHtml.includes('data-mins="1440"') && dashHtml.includes('24h'));
+
+  // 5.3 /api/stats 全面板数据完整性
+  const ms = await fetch(MB + '/api/stats?mins=60').then(r => r.json());
+  ok('stats 含 perMinuteBySource', Array.isArray(ms.perMinuteBySource) && ms.perMinuteBySource.length > 0);
+  ok('stats 含 sources 来源分布', Array.isArray(ms.sources));
+  ok('stats 含 topCountries', Array.isArray(ms.topCountries));
+  ok('stats 含 meta 元数据进度', ms.meta && typeof ms.meta.total === 'number' && typeof ms.meta.withMeta === 'number');
+  ok('stats 含 meta.versions 版本分布', ms.meta.versions && typeof ms.meta.versions.v1 === 'number');
+  ok('stats 含 ipv6 统计', ms.ipv6 && typeof ms.ipv6.pct === 'number');
+  ok('stats 含 system 系统资源', ms.system && typeof ms.system.rss === 'number');
+  ok('stats 含 health 健康度', typeof ms.health === 'number');
+
+  // 5.4 24h 趋势查询（小时桶优化）
+  const ms24 = await fetch(MB + '/api/stats?mins=1440').then(r => r.json());
+  ok('24h 趋势返回小时桶（<=30 个）', ms24.perMinuteBySource.length <= 30 && ms24.perMinuteBySource.length > 0,
+    `len=${ms24.perMinuteBySource.length}`);
+
+  // 5.5 /api/nodes
+  const mnodes = await fetch(MB + '/api/nodes').then(r => r.json());
+  ok('监控 nodes 接口', Array.isArray(mnodes.nodes));
+
+  monitor.stop();
+
   getCollector().stop();
   server.close();
   console.log(`\n结果: ${passed} 通过, ${failed} 失败`);

@@ -9,7 +9,22 @@
    - 历史采集趋势图表 */
 const http = require('http');
 const os = require('os');
+const path = require('path');
+const fs = require('fs');
 const db = require('./db');
+
+const PUBLIC_DIR = path.join(__dirname, '..', '..', 'public');
+const MIME = {
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+};
 
 let collectorRef = null;
 let sitePort = null;
@@ -43,28 +58,32 @@ function systemMetrics() {
   };
 }
 
-/* 时间桶统计（总量） */
+/* 时间桶统计（总量）。
+   minutes <= 360 用分钟桶（60000ms），> 360 用小时桶（3600000ms）避免点过密。 */
 function perMinuteBuckets(minutes) {
   const now = Date.now();
   const from = now - minutes * 60000;
+  const bucketMs = minutes > 360 ? 3600000 : 60000;
   const rows = db.get().prepare(
-    'SELECT (ts/60000)*60000 AS bucket, COUNT(*) AS c FROM obs_log WHERE ts >= ? GROUP BY bucket ORDER BY bucket'
+    `SELECT (ts/${bucketMs})*${bucketMs} AS bucket, COUNT(*) AS c FROM obs_log WHERE ts >= ? GROUP BY bucket ORDER BY bucket`
   ).all(from);
   const map = new Map(rows.map(r => [Number(r.bucket), r.c]));
   const out = [];
-  for (let t = Math.floor(from / 60000) * 60000; t <= now; t += 60000) {
+  for (let t = Math.floor(from / bucketMs) * bucketMs; t <= now; t += bucketMs) {
     out.push({ t, c: map.get(t) || 0 });
   }
   return out;
 }
 
-/* 按来源分桶统计 —— 用于堆叠面积图，展示各采集器贡献 */
+/* 按来源分桶统计 —— 用于堆叠面积图，展示各采集器贡献。
+   minutes <= 360 用分钟桶，> 360 用小时桶。 */
 const SOURCES = ['dht_passive', 'dht_active', 'dht_sample', 'tracker', 'pex', 'simulator'];
 function perMinuteBySource(minutes) {
   const now = Date.now();
   const from = now - minutes * 60000;
+  const bucketMs = minutes > 360 ? 3600000 : 60000;
   const rows = db.get().prepare(
-    'SELECT (ts/60000)*60000 AS bucket, source, COUNT(*) AS c FROM obs_log WHERE ts >= ? GROUP BY bucket, source ORDER BY bucket'
+    `SELECT (ts/${bucketMs})*${bucketMs} AS bucket, source, COUNT(*) AS c FROM obs_log WHERE ts >= ? GROUP BY bucket, source ORDER BY bucket`
   ).all(from);
   // bucket -> { t, dht_passive, dht_active, ... }
   const map = new Map();
@@ -75,7 +94,7 @@ function perMinuteBySource(minutes) {
     o[r.source] = (o[r.source] || 0) + r.c;
   }
   const out = [];
-  for (let t = Math.floor(from / 60000) * 60000; t <= now; t += 60000) {
+  for (let t = Math.floor(from / bucketMs) * bucketMs; t <= now; t += bucketMs) {
     const o = map.get(t) || { t };
     o.total = SOURCES.reduce((s, k) => s + (o[k] || 0), 0);
     out.push(o);
@@ -166,6 +185,16 @@ function healthScore(stats) {
 async function handle(req, res) {
   const u = new URL(req.url, 'http://localhost');
   const pathname = u.pathname;
+
+  // 静态资源服务（Chart.js / CSS / 字体等，从 public 目录提供）
+  if (pathname.startsWith('/assets/')) {
+    const file = path.normalize(path.join(PUBLIC_DIR, pathname));
+    if (!file.startsWith(PUBLIC_DIR) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      return json(res, 404, { error: 'NOT_FOUND' });
+    }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'public, max-age=3600' });
+    return fs.createReadStream(file).pipe(res);
+  }
 
   if (pathname === '/' || pathname === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -377,6 +406,8 @@ function dashboardHtml() {
           <button class="tw-btn active" data-mins="60">1h</button>
           <button class="tw-btn" data-mins="180">3h</button>
           <button class="tw-btn" data-mins="360">6h</button>
+          <button class="tw-btn" data-mins="720">12h</button>
+          <button class="tw-btn" data-mins="1440">24h</button>
         </span>
       </div>
       <div class="chart-container"><canvas id="rateChart"></canvas></div>
@@ -666,7 +697,18 @@ function renderStats(s) {
 
   // 主图：平滑更新（不销毁）
   var chart = ensureRateChart();
-  var labels = s.perMinuteBySource.map(function(b){ return new Date(b.t).toTimeString().slice(0,5); });
+  var bucketMs = curMins > 360 ? 3600000 : 60000;
+  var labels = s.perMinuteBySource.map(function(b){
+    var d = new Date(b.t);
+    if (bucketMs >= 3600000) {
+      // 小时桶：显示 MM/DD HH:00
+      var mm = String(d.getMonth()+1).padStart(2,'0');
+      var dd = String(d.getDate()).padStart(2,'0');
+      var hh = String(d.getHours()).padStart(2,'0');
+      return mm + '/' + dd + ' ' + hh + ':00';
+    }
+    return d.toTimeString().slice(0,5);
+  });
   chart.data.labels = labels;
   SRC_DEFS.forEach(function(sd, i) {
     chart.data.datasets[i].data = s.perMinuteBySource.map(function(b){ return b[sd.key] || 0; });
