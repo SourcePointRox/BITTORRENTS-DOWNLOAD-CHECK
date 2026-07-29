@@ -202,7 +202,7 @@ function start(port, opts = {}) {
     console.log(`[ikwyd] site   : http://localhost:${p}`);
     console.log(`[ikwyd] admin  : http://localhost:${p}/admin/`);
     if (opts.collector === 'sim') { collectorService.startSim(); console.log('[ikwyd] collector: sim mode'); }
-    if (opts.collector === 'live') { collectorService.startLive({ tracker: true, pex: true }); console.log('[ikwyd] collector: live DHT+PEX+Tracker mode'); }
+    if (opts.collector === 'live') { collectorService.startLive({ tracker: true, pex: true, dhtPort: opts.dhtPort }); console.log('[ikwyd] collector: live DHT+PEX+Tracker mode'); }
   });
   return server;
 }

@@ -83,15 +83,15 @@ class ColdStorage {
       getColdNullName: this._coldDb.prepare(
         'SELECT id, infohash_v1, infohash_v2 FROM torrents WHERE name IS NULL LIMIT ?'
       ),
-      // 主库语句
+      // 主库语句（含 infohash_v2 用于 hybrid 种子同步）
       countMain: this._mainDb.prepare('SELECT COUNT(*) AS c FROM torrents'),
       getMainByRowid: this._mainDb.prepare(
-        'SELECT rowid, infohash, name, size, first_seen FROM torrents WHERE rowid > ? ORDER BY rowid ASC LIMIT ?'
+        'SELECT rowid, infohash, infohash_v2, name, size, first_seen FROM torrents WHERE rowid > ? ORDER BY rowid ASC LIMIT ?'
       ),
       getMainSince: this._mainDb.prepare(
-        'SELECT infohash, name, size, first_seen FROM torrents WHERE first_seen > ? ORDER BY first_seen ASC LIMIT ?'
+        'SELECT infohash, infohash_v2, name, size, first_seen FROM torrents WHERE first_seen > ? ORDER BY first_seen ASC LIMIT ?'
       ),
-      getMainOne: this._mainDb.prepare('SELECT infohash, name, size, first_seen FROM torrents WHERE infohash=?'),
+      getMainOne: this._mainDb.prepare('SELECT infohash, infohash_v2, name, size, first_seen FROM torrents WHERE infohash=?'),
     };
   }
 
@@ -104,19 +104,42 @@ class ColdStorage {
   }
 
   /* ---------- 工具 ---------- */
-  /* 检测 infohash 版本：40 hex = v1 (SHA1)，64 hex = v2 (SHA256) */
+  /* 从主库行提取 v1/v2 infohash。
+     hybrid 种子：infohash(40hex) + infohash_v2(64hex) 同时存在
+     纯 v1：infohash(40hex), infohash_v2=null
+     纯 v2：infohash(64hex), infohash_v2=null */
+  _splitHashFromRow(row) {
+    const ih = row.infohash ? String(row.infohash).trim().toLowerCase() : null;
+    const ih2 = row.infohash_v2 ? String(row.infohash_v2).trim().toLowerCase() : null;
+    if (ih && /^[0-9a-f]{40}$/.test(ih)) {
+      // v1 as PK（可能带 v2 = hybrid）
+      return { v1: ih, v2: ih2 };
+    }
+    if (ih && /^[0-9a-f]{64}$/.test(ih)) {
+      // v2 as PK
+      return { v1: null, v2: ih };
+    }
+    return { v1: ih, v2: ih2 };
+  }
+
+  /* 兼容旧接口：检测单个 infohash 版本 */
   _splitHash(infohash) {
     if (!infohash) return { v1: null, v2: null };
     const h = String(infohash).trim().toLowerCase();
     if (/^[0-9a-f]{40}$/.test(h)) return { v1: h, v2: null };
     if (/^[0-9a-f]{64}$/.test(h)) return { v1: null, v2: h };
-    // 其他格式（base32 等）按 v1 处理
     return { v1: h, v2: null };
   }
 
-  /* 生成磁力链接：v1 调用 util.magnetURI；v2 使用 btmh (multihash) 格式 */
-  _buildMagnet(infohash, name) {
-    const { v1, v2 } = this._splitHash(infohash);
+  /* 生成磁力链接。
+     hybrid (v1+v2)：磁链同时携带 btih(v1) 和 btmh(v2)，符合 BEP-52
+     v2 only：btmh multihash base32
+     v1 only：btih hex */
+  _buildMagnet(v1, v2, name) {
+    if (v1 && v2) {
+      // hybrid：同时携带 v1 和 v2
+      return magnetURI(v1, name, { infohashV1: v1 });
+    }
     if (v2) {
       // BEP-52 / multihash: 0x12 (sha2-256) + 0x20 (length 32) + 32 字节摘要，base32 编码
       const multihash = Buffer.concat([Buffer.from([0x12, 0x20]), Buffer.from(v2, 'hex')]);
@@ -138,7 +161,7 @@ class ColdStorage {
       return m;
     }
     // v1：调用 util.magnetURI
-    return magnetURI(v1 || infohash, name);
+    return magnetURI(v1, name);
   }
 
   _loadSyncedSet() {
@@ -180,10 +203,13 @@ class ColdStorage {
     let inserted = 0;
     let updated = 0;
     for (const row of rows) {
-      const { v1, v2 } = this._splitHash(row.infohash);
-      const magnet = this._buildMagnet(row.infohash, row.name);
+      // 使用 hybrid-aware 解析：hybrid 种子的 v1 在 infohash 列、v2 在 infohash_v2 列
+      const { v1, v2 } = this._splitHashFromRow(row);
+      const magnet = this._buildMagnet(v1, v2, row.name);
+      // 已同步判定：v1 或 v2 任一命中即视为已写入冷库
+      const alreadySynced = (v1 && this._syncedSet.has(v1)) || (v2 && this._syncedSet.has(v2));
 
-      if (this._syncedSet.has(row.infohash)) {
+      if (alreadySynced) {
         // 已同步：初始扫描阶段跳过，增量阶段尝试回填 name
         if (!isInitial && row.name != null) {
           const col = v1 ? 'infohash_v1' : 'infohash_v2';
@@ -200,7 +226,8 @@ class ColdStorage {
       const res = this._stmts.insCold.run(v1, v2, row.name ?? null, row.size ?? null, magnet, row.first_seen ?? null);
       if (res.changes > 0) {
         inserted++;
-        this._syncedSet.add(row.infohash);
+        if (v1) this._syncedSet.add(v1);
+        if (v2) this._syncedSet.add(v2);
       }
     }
 
@@ -213,7 +240,9 @@ class ColdStorage {
         if (!ih) continue;
         const main = this._stmts.getMainOne.get(ih);
         if (main && main.name) {
-          const magnet = this._buildMagnet(ih, main.name);
+          // hybrid-aware：从主库行提取 v1/v2 构建正确磁链
+          const { v1, v2 } = this._splitHashFromRow(main);
+          const magnet = this._buildMagnet(v1, v2, main.name);
           const res = this._stmts.updColdById.run(main.name, main.size ?? null, magnet, c.id);
           if (res.changes > 0) { updated++; backfilled++; }
         }

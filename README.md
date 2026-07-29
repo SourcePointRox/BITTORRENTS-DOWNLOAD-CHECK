@@ -37,14 +37,23 @@ BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 
 # 模拟采集模式（默认，无需公网，生成演示数据）
 node scripts/start.js
 
-# 真实 DHT + PEX + Tracker 全网络采集（含 IPv6 + BEP-52）
+# 真实 DHT + PEX + Tracker 全网络采集（含 IPv6 + BEP-52 hybrid）
 node scripts/start.js --live
 
-# 指定端口
-node scripts/start.js --live --port 9000 --monitor-port 9090
+# 指定端口 + DHT 端口
+node scripts/start.js --live --port 9000 --monitor-port 9090 --dht-port 6881
 
 # 仅启动站点（不启动采集器）
 node scripts/start.js --no-collector
+
+# 最小化：仅站点，不启动监控和采集器
+node scripts/start.js --no-collector --no-monitor
+
+# 强制重新生成演示数据
+node scripts/start.js --seed
+
+# 查看帮助
+node scripts/start.js --help
 ```
 
 Windows 下也可双击 `start.bat`。
@@ -500,6 +509,33 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 ---
 
 ## 更新日志
+
+### v0.5.0 — 2026-07-29
+
+#### 新增
+
+- **混合种子 (Hybrid Torrent) 全链路支持 (BEP-52)**：
+  - 混合种子同时携带 v1 (SHA-1/40-hex) 和 v2 (SHA-256/64-hex) infohash，BEP-52 规范允许此类种子的 info dict 同时包含 v2 的 file tree 和 v1 的 files/pieces
+  - **元数据解析**（`metadata.js`）：`parseInfo` 检测 hybrid（同时有 file tree 和 v1 字段），`resolveAndStore` 同时计算 v1+v2 哈希，以 v1 作为主键、v2 存入 `infohash_v2` 列，`hash_version=3`
+  - **数据合并**（`pipeline.js`）：新增 `linkHybridInfohash(v1, v2)` 函数，将之前以 v2 infohash 登记的占位行数据合并到 v1 主键行——observations 合并 hits、obs_log 改写 infohash、torrent_daily 合并 peers 计数、删除 v2 占位行
+  - **采集服务**（`service.js`）：hybrid 种子解析成功后注册 v2 infohash 到 DHT 查询，发现更多 peer
+  - **API**（`api.js`）：`/api/torrent/info` 和 `/api/torrent/peers` 按 v2 infohash 查找时回退到 `infohash_v2` 列，返回 `infohashV2` / `hashVersion` 字段
+  - **磁力链接**（`util.js`）：hybrid 磁链同时携带 `xt=urn:btih:` (v1) 和 `xt=urn:btmh:` (v2)，符合 BEP-52
+  - **页面展示**（`pages.js`）：种子详情页同时展示 v1 和 v2 infohash，hybrid 标注 `(v1)` / `(hybrid)`
+  - **冷存储**（`cold-storage.js`）：`syncOnce` 和回填均使用 hybrid-aware 的 `_splitHashFromRow`，正确提取 v1+v2 构建双 xt 磁链，同步去重集合同时追踪 v1 和 v2
+
+- **快速启动脚本重写**（`scripts/start.js`）：
+  - 完整 CLI 参数解析：`--live` / `--no-collector` / `--no-monitor` / `--port` / `--monitor-port` / `--dht-port` / `--seed` / `--help`
+  - 环境预检：Node.js 版本检测（≥ 22.5）+ `node:sqlite` 可用性验证，失败给出明确提示
+  - 健康探活：启动后自动请求 `/api/overview` 验证站点就绪，10 次重试
+  - 优雅退出：SIGINT/SIGTERM 信号处理，按序关闭采集器 → 监控 WebUI → 站点 HTTP，3 秒兜底强制退出
+  - 新增 `monitor.stop()` 函数，支持优雅关闭监控 WebUI
+  - DHT 端口可配置：`--dht-port` 透传到 `startLive` → `DHTSpider`
+
+#### 修复
+
+- **冷存储 hybrid 同步 bug**：`syncOnce` 原使用 `_splitHash(row.infohash)` 单哈希解析，无法处理 hybrid 种子（v1 在 infohash 列、v2 在 infohash_v2 列）。修正为使用 `_splitHashFromRow(row)` 正确提取 v1+v2，磁链构建和去重集合均同步更新
+- **冷存储回填磁链 bug**：回填 name 为空的行时使用单 infohash 构建磁链，hybrid 种子磁链缺失 v2 xt。修正为从主库行提取 v1+v2 构建正确双 xt 磁链
 
 ### v0.4.0 — 2026-07-29
 

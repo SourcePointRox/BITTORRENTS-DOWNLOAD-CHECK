@@ -569,21 +569,26 @@ document.addEventListener('DOMContentLoaded', function () {
   return layout({ title: `Annual Torrents Statistics for ${year}`, description: 'Annual bittorrent statistics', content, bodyExtra });
 }
 
-/* ---------- 5. 种子详情页（增强：infohash + magnet + 最早记录） ---------- */
+/* ---------- 5. 种子详情页（增强：infohash + magnet + 最早记录 + hybrid 支持） ---------- */
 function pageTorrent(infohash) {
   const d = db.get();
-  const t = d.prepare('SELECT * FROM torrents WHERE infohash=?').get(infohash);
+  let t = d.prepare('SELECT * FROM torrents WHERE infohash=?').get(infohash);
+  // hybrid 支持：按 v2 infohash 查找时回退到 infohash_v2 列
+  if (!t && infohash.length === 64) {
+    t = d.prepare('SELECT * FROM torrents WHERE infohash_v2=?').get(infohash);
+  }
   if (!t) return page404('Torrent not found in our database');
-  const magnet = magnetURI(t.infohash, t.name);
+  const canonicalHash = t.infohash;
+  const magnet = magnetURI(t.infohash, t.name, { infohashV1: t.infohash });
   const g = { category: t.category || 'Unsorted' };
 
   // 最近 30 天每日 peer 曲线
-  const daily = d.prepare('SELECT day, peers FROM torrent_daily WHERE infohash=? ORDER BY day DESC LIMIT 30').all(infohash).reverse();
+  const daily = d.prepare('SELECT day, peers FROM torrent_daily WHERE infohash=? ORDER BY day DESC LIMIT 30').all(canonicalHash).reverse();
 
   // 最近 peer 列表
   const peers = d.prepare(`
     SELECT ip, MAX(ts) AS last_ts, COUNT(*) AS hits FROM obs_log
-    WHERE infohash=? GROUP BY ip ORDER BY last_ts DESC LIMIT 50`).all(infohash);
+    WHERE infohash=? GROUP BY ip ORDER BY last_ts DESC LIMIT 50`).all(canonicalHash);
   const peerRows = peers.map(p => {
     const pg = geo.lookup(p.ip);
     return `<tr>
@@ -619,8 +624,10 @@ function pageTorrent(infohash) {
                 <div class="padding-block">
                     <table class="table table-borderless table-sm torrent-props">
                         <tr><td class="grey-text">Size</td><td><b>${formatSize(t.size)}</b></td></tr>
-                        <tr><td class="grey-text">Info hash</td><td><span class="infohash">${t.infohash}</span>
+                        <tr><td class="grey-text">Info hash ${t.hash_version === 3 ? '(v1)' : ''}</td><td><span class="infohash">${t.infohash}</span>
                             <button class="btn btn-light btn-sm" data-clipboard="${t.infohash}"><i class="fa fa-clipboard"></i></button></td></tr>
+                        ${t.infohash_v2 ? `<tr><td class="grey-text">Info hash v2 ${t.hash_version === 3 ? '(hybrid)' : ''}</td><td><span class="infohash">${t.infohash_v2}</span>
+                            <button class="btn btn-light btn-sm" data-clipboard="${t.infohash_v2}"><i class="fa fa-clipboard"></i></button></td></tr>` : ''}
                         <tr><td class="grey-text">Magnet link</td><td>
                             <div class="input-group magnet-box">
                               <input type="text" class="form-control input-sm" readonly value="${esc(magnet)}" onclick="this.select()">

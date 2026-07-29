@@ -160,7 +160,16 @@ class CollectorService {
     try {
       const rows = db.get().prepare('SELECT ip,port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 20').all(ih);
       const m = await metadata.resolveAndStore(ih, rows);
-      if (m) this.counters.metaResolved++; else this.counters.metaFailed++;
+      if (m) {
+        this.counters.metaResolved++;
+        // hybrid 种子解析成功后，注册 v2 infohash 用于 DHT 查询发现更多 peer
+        if (m.isHybrid && m.infohash_v2) {
+          pipeline.registerInfohash(m.infohash_v2);
+          this.counters.newTorrents++;
+        }
+      } else {
+        this.counters.metaFailed++;
+      }
     } catch (_) { this.counters.metaFailed++; }
     this.metaWorking--;
     if (this.metaQueue.length) this._pumpMeta();

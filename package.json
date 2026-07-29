@@ -1,6 +1,6 @@
 {
   "name": "ikwyd-clone",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Sandbox clone of iknowwhatyoudownload.com with infohash/magnet/first-seen enhancements. Zero-dependency Node.js.",
   "main": "src/server/index.js",

@@ -9,6 +9,17 @@ function sha256hex(buf) { return crypto.createHash('sha256').update(buf).digest(
 function randomBytes(n) { return crypto.randomBytes(n); }
 function randomHex(n) { return crypto.randomBytes(n).toString('hex'); }
 
+/* 同时计算 v1(SHA-1) 和 v2(SHA-256) infohash。
+   用于 hybrid 种子检测：一个 info dict 同时产出 v1 和 v2 哈希。
+   BEP-52 hybrid 种子的 info dict 同时包含 file tree(v2) 和 files/pieces(v1)，
+   两个哈希独立计算，互不相等。 */
+function computeBothHashes(infoRaw) {
+  return {
+    v1: crypto.createHash('sha1').update(infoRaw).digest('hex'),
+    v2: crypto.createHash('sha256').update(infoRaw).digest('hex'),
+  };
+}
+
 /* base32 (RFC 4648) —— 用于 v1 磁力链接的 btih 展示 */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 function base32Encode(buf) {
@@ -143,6 +154,7 @@ function slugify(name) {
 
 module.exports = {
   sha1, sha1hex, sha256, sha256hex, randomBytes, randomHex, base32Encode,
+  computeBothHashes,
   normalizeInfohash, isV2Infohash, magnetURI, formatSize, fmtUTC, fmtDay,
   isIPv4, isIPv6, ipFamily, ipToInt, intToIp, formatIPv6, esc, slugify,
 };

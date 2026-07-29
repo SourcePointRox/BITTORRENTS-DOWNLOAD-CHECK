@@ -827,6 +827,8 @@ setInterval(refresh, 2000);
 </html>`;
 }
 
+let _server = null;
+
 function start(port) {
   const server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
@@ -837,7 +839,12 @@ function start(port) {
   server.listen(port, () => {
     console.log(`[monitor] 监控 WebUI: http://localhost:${port}/`);
   });
+  _server = server;
   return server;
 }
 
-module.exports = { start, init };
+function stop() {
+  if (_server) { try { _server.close(); } catch (_) {} _server = null; }
+}
+
+module.exports = { start, stop, init };

@@ -9,7 +9,7 @@ const crypto = require('crypto');
 const bencode = require('../common/bencode');
 const { decodeWithNext } = bencode;
 const pipeline = require('./pipeline');
-const { normalizeInfohash, isV2Infohash, sha256hex } = require('../common/util');
+const { normalizeInfohash, isV2Infohash, sha256hex, computeBothHashes } = require('../common/util');
 const { initiateMSE } = require('./mse');
 
 const PSTR = Buffer.from('BitTorrent protocol');
@@ -31,9 +31,13 @@ function parseInfo(infoRaw) {
     : info.name ? info.name.toString('utf8') : null;
   let size = 0; const files = [];
   const isV2 = info['meta version'] === 2;
+  const hasFileTree = !!(isV2 && info['file tree']);
+  // hybrid 检测：BEP-52 hybrid 种子同时包含 v2 的 file tree 和 v1 的 files/pieces
+  const hasV1Fields = !!(info.files || info.pieces || info.length);
+  const isHybrid = hasFileTree && hasV1Fields;
 
-  if (isV2 && info['file tree']) {
-    // BEP-52 v2: 递归遍历 file tree 提取文件
+  if (hasFileTree) {
+    // BEP-52 v2/hybrid: 递归遍历 file tree 提取文件
     const walkTree = (tree, pathParts) => {
       for (const [key, val] of Object.entries(tree)) {
         if (key === '' && val.length !== undefined) {
@@ -48,7 +52,7 @@ function parseInfo(infoRaw) {
     };
     walkTree(info['file tree'], []);
     // v2 的 piece layers（可选，存储为原始数据）
-    return { name, size, files, isV2: true, fileTree: info['file tree'], pieceLayers: info['piece layers'] };
+    return { name, size, files, isV2: true, isHybrid, fileTree: info['file tree'], pieceLayers: info['piece layers'] };
   }
 
   // v1: files 列表或单文件
@@ -62,7 +66,7 @@ function parseInfo(infoRaw) {
     size = info.length;
     files.push({ path: name, size });
   }
-  return { name, size, files, isV2: false };
+  return { name, size, files, isV2: false, isHybrid: false };
 }
 
 /* 从单个 peer 拉取元数据（明文 BT 握手）。返回 Promise<Buffer|null>（info 原始字节） */
@@ -293,7 +297,7 @@ setInterval(() => {
 }, 30000).unref();
 
 /* 元数据解析并入库：并行尝试多个 peer（DHT peer 质量参差，并行提高成功率）。
-   v1: SHA-1 校验；v2: SHA-256 校验。 */
+   v1: SHA-1 校验；v2: SHA-256 校验；hybrid: 同时计算两个哈希，以 v1 作为主键。 */
 async function resolveAndStore(infohashHex, peersList) {
   const infohash = normalizeInfohash(infohashHex);
   if (!infohash) return null;
@@ -309,17 +313,38 @@ async function resolveAndStore(infohashHex, peersList) {
     if (r.status !== 'fulfilled' || !r.value || !r.value.raw) { diag.conn++; continue; }
     const raw = r.value.raw;
     if (raw.length < 1) { diag.conn++; continue; }
-    // v1: SHA-1(20字节/40hex); v2: SHA-256(32字节/64hex)
-    const hash = isV2
-      ? crypto.createHash('sha256').update(raw).digest('hex')
-      : crypto.createHash('sha1').update(raw).digest('hex');
-    if (hash !== infohash) {
+    // 同时计算 v1(SHA-1) 和 v2(SHA-256) 哈希，用于 hybrid 检测
+    const hashes = computeBothHashes(raw);
+    const expectedHash = isV2 ? hashes.v2 : hashes.v1;
+    if (expectedHash !== infohash) {
       diag.sha++;
-      if (diag.debug < 5) { diag.debug++; console.log('[meta-debug] SHA mismatch', infohash.slice(0,12), 'got', hash.slice(0,12), 'len', raw.length); }
+      if (diag.debug < 5) { diag.debug++; console.log('[meta-debug] SHA mismatch', infohash.slice(0,12), 'got', expectedHash.slice(0,12), 'len', raw.length); }
       continue;
     }
     const meta = parseInfo(raw);
     if (!meta.name) { diag.noname++; continue; }
+
+    // hybrid 种子：同时有 v1 和 v2 infohash，以 v1 作为主键，v2 存入 infohash_v2
+    if (meta.isHybrid) {
+      const v1Hash = hashes.v1;
+      const v2Hash = hashes.v2;
+      pipeline.upsertTorrentMeta({
+        infohash: v1Hash,           // v1 作为主键（canonical）
+        hash_version: 3,             // hybrid
+        infohash_v2: v2Hash,         // v2 存入 infohash_v2
+        name: meta.name, size: meta.size, files: meta.files,
+        category: classify(meta.name), metadata_ok: 1,
+        first_seen: Date.now(), last_seen: Date.now(),
+        piece_layers: meta.pieceLayers,
+        file_tree: meta.fileTree,
+      });
+      // 合并可能存在的 v2-keyed 行（之前以 v2 infohash 登记的占位行）
+      pipeline.linkHybridInfohash(v1Hash, v2Hash);
+      diag.ok++;
+      return { ...meta, infohash: v1Hash, infohash_v2: v2Hash, hash_version: 3 };
+    }
+
+    // 纯 v1 或纯 v2
     pipeline.upsertTorrentMeta({
       infohash,
       hash_version: isV2 ? 2 : 1,

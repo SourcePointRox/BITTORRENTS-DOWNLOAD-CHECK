@@ -95,13 +95,20 @@ const handlers = {
       : { ip, exists: false });
   },
 
-  /* 官方 Torrent API: /api/torrent/info/{infohash} */
+  /* 官方 Torrent API: /api/torrent/info/{infohash}
+     hybrid 支持：按 v2 infohash 查找时回退到 infohash_v2 列 */
   'GET /api/torrent/info': (req, res, q, infohash) => {
     const d = db.get();
-    const t = d.prepare('SELECT * FROM torrents WHERE infohash=?').get(infohash);
+    let t = d.prepare('SELECT * FROM torrents WHERE infohash=?').get(infohash);
+    if (!t && infohash.length === 64) {
+      // v2 infohash 未命中，尝试作为 hybrid 的 infohash_v2 查找
+      t = d.prepare('SELECT * FROM torrents WHERE infohash_v2=?').get(infohash);
+    }
     if (!t) return err(res, 404, 'INFOHASH_NOT_FOUND', 'torrent with infohash not found in our database');
     json(res, 200, {
       infohash: t.infohash,
+      infohashV2: t.infohash_v2 || undefined,                                      // hybrid 的 v2 infohash
+      hashVersion: t.hash_version || 1,                                             // 1=v1, 2=v2, 3=hybrid
       torrentName: t.name || t.infohash,
       size: t.size || 0,
       category: t.category || 'Unsorted',
@@ -110,26 +117,31 @@ const handlers = {
       dateAdded: t.first_seen ? new Date(t.first_seen).toISOString() : undefined, // 最早记录发布时间
       firstSeen: t.first_seen ? new Date(t.first_seen).toISOString() : undefined, // 增强别名
       alive: !!t.alive,
-      magnet: magnetURI(t.infohash, t.name),                                      // 增强
+      magnet: magnetURI(t.infohash, t.name, { infohashV1: t.infohash }),           // hybrid 磁链携带 v1+v2
       files: t.files_json ? JSON.parse(t.files_json) : undefined,
     });
   },
 
-  /* 官方: /api/torrent/peers/{infohash}?day=&countryCode= */
+  /* 官方: /api/torrent/peers/{infohash}?day=&countryCode=
+     hybrid 支持：按 v2 infohash 查找时回退到 infohash_v2 列 */
   'GET /api/torrent/peers': (req, res, q, infohash) => {
     const d = db.get();
-    const t = d.prepare('SELECT infohash FROM torrents WHERE infohash=?').get(infohash);
+    let t = d.prepare('SELECT infohash FROM torrents WHERE infohash=?').get(infohash);
+    if (!t && infohash.length === 64) {
+      t = d.prepare('SELECT infohash FROM torrents WHERE infohash_v2=?').get(infohash);
+    }
     if (!t) return err(res, 404, 'INFOHASH_NOT_FOUND', 'torrent with infohash not found in our database');
+    const canonicalHash = t.infohash; // 使用 v1 主键查询观测数据
     let day = q.get('day');
     if (!day) {
-      const r = d.prepare('SELECT MAX(day) AS day FROM torrent_daily WHERE infohash=?').get(infohash);
+      const r = d.prepare('SELECT MAX(day) AS day FROM torrent_daily WHERE infohash=?').get(canonicalHash);
       day = (r && r.day) || fmtDay(Date.now());
     }
     const cc = q.get('countryCode');
     // 当日该种子 peer 的 IP 列表（供详情页与报告共用）
     const dayStart = Date.parse(day + 'T00:00:00Z');
     const ips = d.prepare(`SELECT DISTINCT ip FROM obs_log WHERE infohash=? AND ts>=? AND ts<? LIMIT 20000`)
-      .all(infohash, dayStart, dayStart + 86400000).map(r => r.ip);
+      .all(canonicalHash, dayStart, dayStart + 86400000).map(r => r.ip);
     const byCountry = new Map();
     for (const ip of ips) {
       const g = geo.lookup(ip);

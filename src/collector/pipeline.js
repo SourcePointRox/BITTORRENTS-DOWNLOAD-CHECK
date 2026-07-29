@@ -234,6 +234,54 @@ function registerInfohash(ih) {
   return isNew;
 }
 
+/* hybrid 种子合并：将 v2 infohash 关联的观测数据合并到 v1 主键行。
+   场景：hybrid 种子可能先以 v2 infohash（64-hex）被 DHT 发现并登记占位行，
+   元数据解析后发现是 hybrid，计算出 v1 infohash 作为 canonical 主键。
+   此函数将 v2-keyed 行的观测数据迁移到 v1 行，并删除 v2 占位行。
+   - observations: 将 (ip, v2Hash) 改为 (ip, v1Hash)
+   - obs_log: 将 infohash=v2Hash 改为 v1Hash
+   - torrent_daily: 合并 v2 行的 peers 计数到 v1 行
+   - torrents: 删除 v2 占位行（v1 行已由 upsertTorrentMeta 创建/更新） */
+function linkHybridInfohash(v1Hash, v2Hash) {
+  if (!v1Hash || !v2Hash || v1Hash === v2Hash) return;
+  const d = db.get();
+  try {
+    d.exec('BEGIN');
+    // 1. observations: (ip, v2Hash) → (ip, v1Hash)，若 v1 已存在则合并 hits
+    const v2Obs = d.prepare('SELECT ip, first_seen, last_seen, hits FROM observations WHERE infohash=?').all(v2Hash);
+    for (const o of v2Obs) {
+      const existing = d.prepare('SELECT first_seen, last_seen, hits FROM observations WHERE ip=? AND infohash=?').get(o.ip, v1Hash);
+      if (existing) {
+        d.prepare('UPDATE observations SET first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?), hits=hits+? WHERE ip=? AND infohash=?')
+          .run(o.first_seen, o.last_seen, o.hits, o.ip, v1Hash);
+      } else {
+        d.prepare('INSERT OR REPLACE INTO observations(ip,infohash,first_seen,last_seen,hits) VALUES(?,?,?,?,?)')
+          .run(o.ip, v1Hash, o.first_seen, o.last_seen, o.hits);
+      }
+    }
+    d.prepare('DELETE FROM observations WHERE infohash=?').run(v2Hash);
+
+    // 2. obs_log: infohash=v2Hash → v1Hash
+    d.prepare('UPDATE obs_log SET infohash=? WHERE infohash=?').run(v1Hash, v2Hash);
+
+    // 3. torrent_daily: 合并 v2 的 peers 计数到 v1
+    const v2Daily = d.prepare('SELECT day, peers FROM torrent_daily WHERE infohash=?').all(v2Hash);
+    for (const r of v2Daily) {
+      d.prepare('INSERT INTO torrent_daily(infohash,day,peers) VALUES(?,?,?) ON CONFLICT(infohash,day) DO UPDATE SET peers=peers+excluded.peers')
+        .run(v1Hash, r.day, r.peers);
+    }
+    d.prepare('DELETE FROM torrent_daily WHERE infohash=?').run(v2Hash);
+
+    // 4. torrents: 删除 v2 占位行（v1 行已由 upsertTorrentMeta 处理）
+    d.prepare('DELETE FROM torrents WHERE infohash=?').run(v2Hash);
+
+    d.exec('COMMIT');
+  } catch (e) {
+    try { d.exec('ROLLBACK'); } catch (_) {}
+    // 合并失败不阻断主流程，v2 行保留不影响功能
+  }
+}
+
 /* 初始化长跑维护 + 写队列 */
 function startPipeline() {
   init();
@@ -243,5 +291,6 @@ function startPipeline() {
 
 module.exports = {
   ingest, batch, upsertTorrentMeta, setMetadataCallback, registerInfohash,
+  linkHybridInfohash,
   queueIngest, flushQueue, startPipeline, CATEGORIES,
 };
