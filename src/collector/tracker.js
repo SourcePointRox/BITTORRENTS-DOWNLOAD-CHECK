@@ -383,13 +383,14 @@ const PROBE_INFOHASH = '9c0463c2d21c4be33ec99cb907e7e58f9e6d16a7';
    因此 harvest 只取最快的 N 个，兼顾发现广度与请求量。 */
 const HARVEST_TRACKER_LIMIT = 60;
 
-/* 健康检查参数：全量覆盖每一个 tracker（不再有“只检查前 20 个”的限制）。
-   万级池的探测策略：
-   - 并发 120、单条 5s 超时 → 每轮最坏 ~10000/120*5s ≈ 7 分钟 < 10 分钟检查间隔；
-   - 存活者优先复查（它们贡献 harvest 主力），未检/死亡者插入队列混排；
-   - 连续 3 次失败标记 dead；dead 条目降频复查（每 3 轮 1 次），给临时故障的 tracker 复活机会。 */
+/* 健康检查参数：两档策略。
+   - 快速首轮（fast）：300 并发 × 3s 超时 → 4000 tracker 约 40s 完成首轮；
+   - 常规维护：120 并发 × 5s 超时 → 全量复查约 3 分钟 < 10 分钟间隔。
+   存活者优先复查，连续 3 次失败标记 dead，dead 每 3 轮降频复查 1 次。 */
 const HEALTH_CONCURRENCY = 120;
 const HEALTH_TIMEOUT = 5000;
+const FAST_CONCURRENCY = 300;
+const FAST_TIMEOUT = 3000;
 
 class TrackerManager {
   constructor(opts = {}) {
@@ -402,9 +403,12 @@ class TrackerManager {
     this.lastFetch = { at: 0, sources: [] }; // 最近一次远程拉取的每源统计
     this._checkTimer = null;
     this._fetchTimer = null;
-    this._checking = false;
+    this._checking = false;          // 全量检查锁
+    this._checkingUnchecked = false; // 增量检查锁（仅查未检 tracker）
     this._deadRound = 0;
     this.started = false;
+    this.firstCheckDone = false;     // 首轮快速检查是否完成
+    this._healthProgress = null;     // 当前检查进度 { checked, total, alive, dead, startedAt }
     // 用静态列表播种
     for (const url of PUBLIC_TRACKERS) this._add(url);
   }
@@ -429,16 +433,29 @@ class TrackerManager {
     return true;
   }
 
+  /* 两阶段启动：
+     Phase 1：立即对静态种子（18 个）做快速健康检查（<1s），harvest 立即有存活列表可用
+     Phase 2：流式加载远程列表（每个源完成即添加 tracker），加载完成后立即触发
+              增量快速检查（onlyUnchecked，300 并发 3s 超时，4000 tracker ~40s 完成）
+     定时维护：10 分钟全量复查（120 并发 5s 超时），12 小时刷新远程列表 */
   start() {
     if (this.started) return;
     this.started = true;
-    // 启动即触发一次健康检查与远程拉取
-    this.healthCheck().catch(() => {});
-    this.fetchLists().catch(() => {});
+    // Phase 1：立即快速检查静态种子
+    this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
+    // Phase 2：流式加载远程列表，完成后立即增量快速检查新 tracker
+    this.fetchLists().then(() => {
+      this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
+    }).catch(() => {});
+    // 定时全量复查
     this._checkTimer = setInterval(() => this.healthCheck().catch(() => {}), this.checkInterval);
     this._checkTimer.unref && this._checkTimer.unref();
-    // 每 12 小时从远程列表拉取并补充新 tracker
-    this._fetchTimer = setInterval(() => this.fetchLists().catch(() => {}), 12 * 3600 * 1000);
+    // 每 12 小时刷新远程列表并触发增量检查
+    this._fetchTimer = setInterval(() => {
+      this.fetchLists().catch(() => {}).then(() => {
+        this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
+      });
+    }, 12 * 3600 * 1000);
     this._fetchTimer.unref && this._fetchTimer.unref();
   }
 
@@ -448,11 +465,11 @@ class TrackerManager {
     if (this._fetchTimer) { clearInterval(this._fetchTimer); this._fetchTimer = null; }
   }
 
-  /* 拉取单个远程源的原始文本（不做合并，便于按优先级统一合并）。 */
+  /* 拉取单个远程源的原始文本。超时 12s（文本文件，无需 20s）。 */
   async _fetchOne(src) {
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 20000);
+      const timer = setTimeout(() => ctrl.abort(), 12000);
       const res = await fetch(src, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ikwyd-tracker-fetch/2.0)' } });
       clearTimeout(timer);
       if (!res.ok) return { source: src, ok: false, text: '', error: 'HTTP ' + res.status };
@@ -462,26 +479,24 @@ class TrackerManager {
     }
   }
 
-  /* 并行拉取所有远程列表（单源 20s 超时，失败源自动跳过），
-     再按 sources 声明顺序（实时存活源优先）合并，避免先到达的大列表占满容量。
-     HTML 页面源用正则提取 tracker URL；纯文本源按行解析。
-     记录每源的解析/新增数量供监控展示。 */
+  /* 流式拉取远程列表：每个源完成即立即将 tracker 添加到池中（不等全部完成）。
+     这意味着 newTrackon（~1-2s 返回）的 tracker 在其他 GitHub 源（~5-10s）还在下载时
+     就已经可用，harvest 和健康检查可以提前开始。
+     单源 12s 超时，失败源自动跳过。HTML 页面源用正则提取 tracker URL。 */
   async fetchLists() {
-    const fetched = await Promise.allSettled(this.sources.map(src => this._fetchOne(src)));
-    const summary = [];
-    for (let i = 0; i < this.sources.length; i++) {
-      const src = this.sources[i];
-      const r = fetched[i];
-      if (r.status !== 'fulfilled' || !r.value.ok || !r.value.text) {
-        const err = r.status === 'fulfilled' ? r.value.error : String(r.reason && r.reason.message || r.reason);
-        summary.push({ source: src, ok: false, parsed: 0, added: 0, error: err || 'empty' });
-        continue;
+    const summary = new Array(this.sources.length);
+    // 每个源独立处理：完成即添加 tracker 到池
+    const promises = this.sources.map(async (src, i) => {
+      const r = await this._fetchOne(src);
+      if (!r.ok || !r.text) {
+        summary[i] = { source: src, ok: false, parsed: 0, added: 0, error: r.error || 'empty' };
+        return;
       }
       let candidates;
       if (HTML_SOURCE_RE.test(src)) {
-        candidates = [...extractTrackersFromText(r.value.text)];
+        candidates = [...extractTrackersFromText(r.text)];
       } else {
-        candidates = r.value.text.split(/\r?\n/).map(s => s.trim())
+        candidates = r.text.split(/\r?\n/).map(s => s.trim())
           .filter(s => /^(udp|https?):\/\//i.test(s));
       }
       let added = 0;
@@ -489,31 +504,55 @@ class TrackerManager {
         if (this._add(u)) added++;
         if (this.trackers.size >= this.maxTrackers) break;
       }
-      summary.push({ source: src, ok: true, parsed: candidates.length, added, error: null });
-    }
+      summary[i] = { source: src, ok: true, parsed: candidates.length, added, error: null };
+    });
+    await Promise.allSettled(promises);
     this.lastFetch = { at: Date.now(), sources: summary };
     return summary;
   }
 
-  /* 健康检查：对【每一个】tracker 发轻量 announce（numwant=1），全量覆盖不截断。
-     万级池流式调度：恒定 120 并发，完成一个补一个；单条 5s 超时。
-     连续 3 次失败标记为 dead；dead 条目每 3 轮复查 1 次（保留复活机会）。 */
-  async healthCheck() {
-    if (this._checking) return; // 上一轮未结束则跳过，避免叠加
-    this._checking = true;
-    this._deadRound++;
+  /* 健康检查：对 tracker 发轻量 announce（numwant=1）探测存活。
+     两种模式：
+     - 常规全量（默认）：120 并发 × 5s 超时，存活优先 + dead 降频（每 3 轮 1 次）
+     - 快速增量（fast + onlyUnchecked）：300 并发 × 3s 超时，仅检查未检 tracker（alive===null）
+     快速模式用于启动后快速完成首轮健康检查，常规模式用于定时维护。
+     两种模式使用独立锁，互不阻塞。 */
+  async healthCheck(opts = {}) {
+    const fast = !!opts.fast;
+    const onlyUnchecked = !!opts.onlyUnchecked;
+    const concurrency = fast ? FAST_CONCURRENCY : HEALTH_CONCURRENCY;
+    const timeout = fast ? FAST_TIMEOUT : HEALTH_TIMEOUT;
+
+    // 独立锁：全量和增量互不阻塞
+    if (!onlyUnchecked && this._checking) return;
+    if (onlyUnchecked && this._checkingUnchecked) return;
+
+    if (onlyUnchecked) this._checkingUnchecked = true;
+    else { this._checking = true; this._deadRound++; }
+
+    this._healthProgress = { checked: 0, total: 0, alive: 0, dead: 0, startedAt: Date.now(), fast };
+
     try {
-      // 排序：存活者优先（harvest 主力，需要新鲜延迟数据），其次未检，最后 dead（每 3 轮 1 次）
       const all = Array.from(this.trackers.values());
       const targets = [];
       for (const info of all) {
-        info.rounds = (info.rounds || 0) + 1;
-        if (info.alive === false && this._deadRound % 3 !== 0) continue; // dead 降频
-        targets.push(info);
+        if (onlyUnchecked) {
+          // 增量模式：仅检查未检查过的 tracker
+          if (info.alive !== null) continue;
+          targets.push(info);
+        } else {
+          // 全量模式：存活优先 + dead 降频
+          info.rounds = (info.rounds || 0) + 1;
+          if (info.alive === false && this._deadRound % 3 !== 0) continue;
+          targets.push(info);
+        }
       }
+      this._healthProgress.total = targets.length;
+
+      // 排序：未检优先（快速模式全是未检），存活次之，dead 最后
       targets.sort((a, b) => {
-        const ax = a.alive === true ? 0 : a.alive === null ? 1 : 2;
-        const bx = b.alive === true ? 0 : b.alive === null ? 1 : 2;
+        const ax = a.alive === true ? 1 : a.alive === null ? 0 : 2;
+        const bx = b.alive === true ? 1 : b.alive === null ? 0 : 2;
         return ax - bx;
       });
 
@@ -523,28 +562,34 @@ class TrackerManager {
           const info = targets[idx++];
           const t0 = Date.now();
           try {
-            const r = await scrapeTracker(info.url, PROBE_INFOHASH, { numwant: 1, timeout: HEALTH_TIMEOUT });
+            const r = await scrapeTracker(info.url, PROBE_INFOHASH, { numwant: 1, timeout });
             info.lastCheck = Date.now();
             if (r && r.responded) {
               info.alive = true;
               info.latency = info.lastCheck - t0;
               info.fails = 0;
+              this._healthProgress.alive++;
             } else {
               info.fails = (info.fails || 0) + 1;
-              if (info.fails >= 3) info.alive = false;
+              if (info.fails >= 3) { info.alive = false; this._healthProgress.dead++; }
             }
           } catch (_) {
             info.lastCheck = Date.now();
             info.fails = (info.fails || 0) + 1;
-            if (info.fails >= 3) info.alive = false;
+            if (info.fails >= 3) { info.alive = false; this._healthProgress.dead++; }
           }
+          this._healthProgress.checked++;
         }
       };
       const workers = [];
-      for (let i = 0; i < HEALTH_CONCURRENCY; i++) workers.push(worker());
+      for (let i = 0; i < concurrency; i++) workers.push(worker());
       await Promise.allSettled(workers);
+
+      if (onlyUnchecked && !this.firstCheckDone) this.firstCheckDone = true;
     } finally {
-      this._checking = false;
+      if (onlyUnchecked) this._checkingUnchecked = false;
+      else this._checking = false;
+      this._healthProgress = null;
     }
   }
 
@@ -590,11 +635,23 @@ class TrackerManager {
         dead++;
       }
     }
-    return { total, alive, dead, unchecked: total - alive - dead,
+    const stats = { total, alive, dead, unchecked: total - alive - dead,
       avgLatency: latN ? Math.round(latSum / latN) : 0,
       sources: this.sources.length, maxTrackers: this.maxTrackers,
       checking: this._checking,
+      firstCheckDone: this.firstCheckDone,
       lastFetchAt: this.lastFetch.at, fetchSources: this.lastFetch.sources };
+    // 健康检查进度（检查进行中时返回实时进度）
+    if (this._healthProgress) {
+      const p = this._healthProgress;
+      stats.healthProgress = {
+        checked: p.checked, total: p.total, alive: p.alive, dead: p.dead,
+        pct: p.total > 0 ? Math.round(p.checked * 100 / p.total) : 0,
+        elapsed: Date.now() - p.startedAt,
+        fast: p.fast,
+      };
+    }
+    return stats;
   }
 
   /* 返回 tracker 详情列表。

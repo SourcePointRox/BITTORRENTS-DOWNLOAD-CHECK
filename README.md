@@ -595,6 +595,27 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.6.1 — 2026-07-30
+
+#### 优化
+
+- **Tracker 列表流式加载**（`tracker.js` `fetchLists` 重写）：
+  - **根因**：原 `fetchLists` 用 `Promise.allSettled` 等全部 50+ 源（每个 20s 超时）完成才开始添加 tracker——最慢的源拖住全部，加载期间 harvest 只能用 18 个静态种子
+  - **修复**：每个源完成即立即将 tracker 添加到池中（不等全部完成）。newTrackon（~1-2s 返回）的 tracker 在其他 GitHub 源（~5-10s）还在下载时就已经可用，harvest 和健康检查可以提前开始
+  - 单源超时从 20s 降至 12s（文本文件无需 20s）
+- **健康检查两档策略**（`tracker.js` `healthCheck` 重写）：
+  - **根因**：原 `healthCheck` 单一模式 120 并发 × 5s 超时，4000 tracker 最坏 ~167s；且 `fetchLists` 加载的新 tracker 要等下一个 10 分钟周期才被检查
+  - **快速首轮**（`fast + onlyUnchecked`）：300 并发 × 3s 超时 → 4000 tracker ~40s 完成首轮检查（从 ~167s 降至 ~40s，**4x 提速**）
+  - **常规维护**（默认）：120 并发 × 5s 超时，存活优先 + dead 降频（每 3 轮 1 次）
+  - **增量检查**：`onlyUnchecked` 模式仅检查未检查过的 tracker（`alive===null`），与全量检查使用**独立锁**互不阻塞——`fetchLists` 完成后立即触发增量检查，无需等待 10 分钟周期
+  - **两阶段启动**：Phase 1 立即快速检查 18 个静态种子（<1s，harvest 立即有存活列表）；Phase 2 流式加载完成后立即增量快速检查全部新 tracker
+- **健康检查进度追踪**：`getStats()` 新增 `healthProgress` 字段（`{checked, total, alive, dead, pct, elapsed, fast}`），监控 WebUI 可实时展示检查进度；新增 `firstCheckDone` 标记
+
+#### 验证
+
+- 140 项测试全部通过（30 unit + 59 e2e + 18 stress + 33 admin）
+- 功能验证：36 个 tracker 首轮快速检查 3s 完成（23 存活），流式加载在 500ms 内已有 tracker 可用
+
 ### v0.6.0 — 2026-07-29
 
 > 大版本：万级 Tracker 池 + DHT 多端口集群 + IPv6 双栈引导修复 + 全局爬虫聚合 + WebSeed + 多 BT 站元数据聚合 + 多源 GeoIP + 双 WebUI 美化。
