@@ -438,7 +438,7 @@ function dashboardHtml() {
         <div class="l" style="font-size:10px;color:#54626f">IPv6 占比</div>
         <div class="progress-bar"><div class="progress-fill" id="ipv6Bar" style="width:0%;background:linear-gradient(90deg,#1f6feb,#58a6ff)"></div></div>
       </div>
-      <div style="margin-top:6px;font-size:11px;color:#54626f">DHT 直接捕获 <span id="dhtV6Peers" style="color:#58a6ff">0</span></div>
+      <div style="margin-top:6px;font-size:11px;color:#54626f">DHT 直接捕获 <span id="dhtV6Peers" style="color:#58a6ff">0</span> · uTP(BEP-29) <span id="dhtUtpPeers" style="color:#d29922">0</span></div>
     </div>
 
     <div class="card">
@@ -724,6 +724,7 @@ function renderStats(s) {
     document.getElementById('ipv6Bar').style.width = Math.min(100, v6.pct) + '%';
   }
   document.getElementById('dhtV6Peers').textContent = fmt(s.dht.ipv6Peers || 0);
+  document.getElementById('dhtUtpPeers').textContent = fmt(s.dht.utpPeers || 0);
 
   // v2 / BEP-52 统计面板
   if (s.meta && s.meta.versions) {

@@ -132,7 +132,7 @@ class DHTSpider {
     this.running = false;
     this.sock4 = null;
     this.sock6 = null;
-    this.stats = { rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0 };
+    this.stats = { rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0, utpPeers: 0 };
   }
 
   start() {
@@ -344,6 +344,8 @@ class DHTSpider {
         const port = a.implied_port ? rinfo.port : (a.port || rinfo.port);
         if (ih) {
           this.stats.announces++;
+          // implied_port=1 的 peer 可能在使用 uTP（BEP-29），统计以便监控
+          if (a.implied_port) this.stats.utpPeers++;
           this.onObservation({ ip: rinfo.address, port, infohash: ih, source: 'dht_passive', ts: Date.now() });
         }
         return this._respond(tid, { id: this.nodeId }, rinfo.address, rinfo.port);

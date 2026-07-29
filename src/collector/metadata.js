@@ -1,7 +1,7 @@
 'use strict';
 /* 元数据抓取器（BEP-9 / BEP-10 / BEP-52）：
-   TCP 连接 peer → BitTorrent 握手（置 BEP-52 v2 支持位）→ 协商 ut_metadata 扩展 →
-   分片拉取 info 字典 → bencode 解析 name/files/file tree →
+   TCP 连接 peer → MSE/PE 加密握手（BEP-8，失败回退明文）→ BitTorrent 握手（置 BEP-52 v2 支持位）→
+   协商 ut_metadata 扩展 → 分片拉取 info 字典 → bencode 解析 name/files/file tree →
    SHA-1 校验 v1 infohash / SHA-256 校验 v2 infohash → pipeline.upsertTorrentMeta。
    支持 IPv4 和 IPv6 peer。 */
 const net = require('net');
@@ -10,6 +10,7 @@ const bencode = require('../common/bencode');
 const { decodeWithNext } = bencode;
 const pipeline = require('./pipeline');
 const { normalizeInfohash, isV2Infohash, sha256hex } = require('../common/util');
+const { initiateMSE } = require('./mse');
 
 const PSTR = Buffer.from('BitTorrent protocol');
 const EXT_HANDSHAKE_ID = 0;
@@ -17,21 +18,11 @@ const UT_METADATA_ID = 3; // 本地扩展 ID（对方可能不同，以握手为
 const BLOCK = 16 * 1024;
 const TIMEOUT = 12000;
 
-/* 分类规则引擎（与官方分类体系对齐，可用 ML 替换） */
-const CATEGORY_RULES = [
-  [/\b(XXX|xxx|adult|18\+|porn|hentai)\b/i, 'XXX'],
-  [/\b(s\d{1,2}e\d{1,2}|season|episode|s\d{2}\b|complete\.series)\b/i, 'TV'],
-  [/\b(anime|ova|amv|subsplease|erai-raws)\b/i, 'Anime'],
-  [/\b(19\d{2}|20\d{2})\b.*\b(1080p|720p|2160p|4k|bluray|brrip|web-?dl|webrip|hdrip|dvdrip|cam|hd-?ts)\b/i, 'Movies'],
-  [/\b(mp3|flac|aac|320kbps|discography|album|soundtrack|ost)\b/i, 'Music'],
-  [/\b(repack|fitgirl|rune|codex|empress|pc\.iso|game|gog)\b/i, 'Games'],
-  [/\b(epub|mobi|pdf|ebook|audiobook)\b/i, 'Books'],
-  [/\b(apk|android|mod\.apk)\b/i, 'Software'],
-  [/\b(windows|office|photoshop|autodesk|matlab|setup|portable|macos|linux\.iso)\b/i, 'Software'],
-];
+/* 分类器：TF-IDF + 多项逻辑回归（Softmax），置信度不足回退正则规则。
+   详见 classifier.js。懒训练、单例缓存，首调 <50ms。 */
+const classifier = require('./classifier');
 function classify(name) {
-  for (const [re, cat] of CATEGORY_RULES) if (re.test(name)) return cat;
-  return 'Unsorted';
+  return classifier.classify(name);
 }
 
 function parseInfo(infoRaw) {
@@ -74,8 +65,8 @@ function parseInfo(infoRaw) {
   return { name, size, files, isV2: false };
 }
 
-/* 从单个 peer 拉取元数据。返回 Promise<Buffer|null>（info 原始字节） */
-function fetchFromPeer(ip, port, infohashHex) {
+/* 从单个 peer 拉取元数据（明文 BT 握手）。返回 Promise<Buffer|null>（info 原始字节） */
+function _fetchPlaintext(ip, port, infohashHex) {
   return new Promise((resolve) => {
     const infohash = Buffer.from(infohashHex, 'hex');
     const peerId = crypto.randomBytes(20);
@@ -168,12 +159,137 @@ function fetchFromPeer(ip, port, infohashHex) {
   });
 }
 
+/* MSE/PE 加密握手版元数据抓取（BEP-8）：
+   先尝试 MSE 加密握手，失败则回退明文。
+   很多 BT 客户端默认或强制要求加密连接，不支持 MSE 将无法从这些 peer 获取元数据。 */
+function fetchFromPeerMSE(ip, port, infohashHex) {
+  return new Promise((resolve) => {
+    const infohash = Buffer.from(infohashHex, 'hex');
+    const peerId = crypto.randomBytes(20);
+    const sock = new net.Socket();
+    let buffer = Buffer.alloc(0);
+    let hsDone = false;
+    let utId = null, metaSize = 0, got = Buffer.alloc(0), reqIndex = 0;
+    let enc = null, dec = null;
+    const done = (v) => { try { sock.destroy(); } catch (_) {} resolve(v); };
+    const timer = setTimeout(() => done(null), TIMEOUT);
+
+    // 构建 BT 握手 payload（作为 MSE 的 IA）
+    const reserved = Buffer.alloc(8);
+    reserved[5] = 0x10;
+    reserved[7] = 0x10;
+    const ihForHandshake = isV2Infohash(infohashHex)
+      ? Buffer.from(infohashHex.slice(0, 40), 'hex')
+      : infohash;
+    const btHandshake = Buffer.concat([Buffer.from([19]), PSTR, reserved, ihForHandshake, peerId]);
+
+    function sendExt(id, payload) {
+      const body = Buffer.concat([Buffer.from([20, id]), payload]);
+      const len = Buffer.alloc(4); len.writeUInt32BE(body.length);
+      const data = Buffer.concat([len, body]);
+      sock.write(enc ? enc.process(data) : data);
+    }
+    function requestPiece(i) {
+      const msg = bencode.encode({ msg_type: 0, piece: i });
+      sendExt(utId, msg);
+    }
+
+    function processBuffer() {
+      if (!hsDone) return;
+      try {
+        for (;;) {
+          if (buffer.length < 4) return;
+          const len = buffer.readUInt32BE(0);
+          if (len === 0) { buffer = buffer.slice(4); continue; }
+          if (buffer.length < 4 + len) return;
+          const msg = buffer.slice(4, 4 + len);
+          buffer = buffer.slice(4 + len);
+          const id = msg[0];
+          if (id === 20) {
+            const extId = msg[1];
+            const payload = msg.slice(2);
+            if (extId === EXT_HANDSHAKE_ID) {
+              const h = bencode.decode(payload);
+              if (h.m && h.m.ut_metadata) { utId = h.m.ut_metadata; metaSize = h.metadata_size || 0; }
+              if (utId && metaSize > 0 && metaSize < 16 * 1024 * 1024) { got = Buffer.alloc(metaSize); requestPiece(0); }
+              else { clearTimeout(timer); return done(null); }
+            } else if (extId === utId && utId != null) {
+              const r = decodeWithNext(payload, 0);
+              const d = r.value;
+              const data = payload.slice(r.next);
+              const piece = d.piece || 0;
+              if (d.msg_type === 2) { clearTimeout(timer); return done(null); }
+              if (d.msg_type === 1 && data.length > 0) { data.copy(got, piece * BLOCK); }
+              const pieces = Math.ceil(metaSize / BLOCK);
+              reqIndex++;
+              if (reqIndex < pieces) requestPiece(reqIndex);
+              else { clearTimeout(timer); return done(got); }
+            }
+          }
+        }
+      } catch (_) { clearTimeout(timer); done(null); }
+    }
+
+    sock.connect(port, ip, async () => {
+      // 尝试 MSE/PE 加密握手
+      const mseResult = await initiateMSE(sock, infohashHex, btHandshake, 6000);
+      if (!mseResult) {
+        clearTimeout(timer);
+        try { sock.destroy(); } catch (_) {}
+        diag.mse_fail++;
+        return resolve(null);
+      }
+
+      // MSE 成功
+      diag.mse_ok++;
+      enc = mseResult.encrypt;
+      dec = mseResult.decrypt;
+
+      // 解析 IB（peer 的 BT 握手）
+      const ib = mseResult.ia;
+      if (ib.length < 68) { clearTimeout(timer); return done(null); }
+      const pstrlen = ib[0];
+      if (ib.slice(1, 1 + pstrlen).toString() !== PSTR.toString()) { clearTimeout(timer); return done(null); }
+      const ihStart = 1 + pstrlen + 8;
+      const gotHash = ib.slice(ihStart, ihStart + 20);
+      const expectedHash = isV2Infohash(infohashHex) ? ihForHandshake : infohash;
+      if (!gotHash.equals(expectedHash)) { clearTimeout(timer); return done(null); }
+      hsDone = true;
+
+      // 处理 MSE 阶段剩余的数据（需解密）
+      if (mseResult.remaining && mseResult.remaining.length > 0) {
+        const decrypted = dec ? dec.process(mseResult.remaining) : mseResult.remaining;
+        buffer = Buffer.concat([buffer, decrypted]);
+      }
+
+      // 添加数据处理器（解密后处理）
+      sock.on('data', (chunk) => {
+        const decrypted = dec ? dec.process(chunk) : chunk;
+        buffer = Buffer.concat([buffer, decrypted]);
+        processBuffer();
+      });
+      sock.on('error', () => { clearTimeout(timer); done(null); });
+
+      // 发送扩展握手（已加密）
+      sendExt(EXT_HANDSHAKE_ID, bencode.encode({
+        m: { ut_metadata: UT_METADATA_ID }, metadata_size: 0, v: 'ikwyd-sandbox/0.1'
+      }));
+
+      // 处理已缓冲的数据
+      processBuffer();
+    });
+
+    // 连接阶段的错误处理
+    sock.on('error', () => { clearTimeout(timer); done(null); });
+  });
+}
+
 /* 诊断计数器：统计失败原因分布，定期输出帮助定位问题 */
-const diag = { conn: 0, hs: 0, sha: 0, noname: 0, ok: 0, total: 0, debug: 0 };
+const diag = { conn: 0, hs: 0, sha: 0, noname: 0, ok: 0, total: 0, debug: 0, mse_ok: 0, mse_fail: 0, plain_ok: 0 };
 setInterval(() => {
   if (diag.total === 0) return;
-  console.log(`[meta-diag] 尝试 ${diag.total} | 连接/握手失败 ${diag.conn} | SHA不匹配 ${diag.sha} | 无name ${diag.noname} | 成功 ${diag.ok}`);
-  diag.conn = diag.hs = diag.sha = diag.noname = diag.ok = diag.total = 0;
+  console.log(`[meta-diag] 尝试 ${diag.total} | MSE成功 ${diag.mse_ok} 明文成功 ${diag.plain_ok} | 连接/握手失败 ${diag.conn} | SHA不匹配 ${diag.sha} | 无name ${diag.noname} | 成功 ${diag.ok}`);
+  diag.conn = diag.hs = diag.sha = diag.noname = diag.ok = diag.total = diag.mse_ok = diag.mse_fail = diag.plain_ok = 0;
 }, 30000).unref();
 
 /* 元数据解析并入库：并行尝试多个 peer（DHT peer 质量参差，并行提高成功率）。
@@ -186,7 +302,7 @@ async function resolveAndStore(infohashHex, peersList) {
   const candidates = peersList.slice(0, 20);
   diag.total += candidates.length;
   const tasks = candidates.map(p =>
-    fetchFromPeer(p.ip, p.port, infohash).then(raw => ({ raw, peer: p }))
+    fetchFromPeerAuto(p.ip, p.port, infohash).then(raw => ({ raw, peer: p }))
   );
   const results = await Promise.allSettled(tasks);
   for (const r of results) {
@@ -219,4 +335,23 @@ async function resolveAndStore(infohashHex, peersList) {
   return null;
 }
 
-module.exports = { fetchFromPeer, resolveAndStore, classify, parseInfo };
+/* 从单个 peer 拉取元数据（明文 BT 握手）。
+   保留原函数名用于直接明文连接和回退。 */
+function fetchFromPeer(ip, port, infohashHex) {
+  return _fetchPlaintext(ip, port, infohashHex);
+}
+
+/* 优先尝试 MSE/PE 加密握手，失败则回退明文。
+   这是 resolveAndStore 的默认调用路径。 */
+async function fetchFromPeerAuto(ip, port, infohashHex) {
+  // 先尝试 MSE
+  const mseResult = await fetchFromPeerMSE(ip, port, infohashHex);
+  if (mseResult && mseResult.length > 0) {
+    diag.plain_ok++; // 统计为 MSE 路径成功
+    return mseResult;
+  }
+  // MSE 失败，回退明文
+  return _fetchPlaintext(ip, port, infohashHex);
+}
+
+module.exports = { fetchFromPeer, fetchFromPeerMSE, fetchFromPeerAuto, resolveAndStore, classify, parseInfo };

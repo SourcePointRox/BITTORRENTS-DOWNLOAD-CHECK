@@ -256,8 +256,8 @@ class CollectorService {
       dht: this.spider ? {
         running: true, nodes: dhtNodes, port: this.spider.port,
         rx: s.rx, tx: s.tx, peers: s.peers, announces: s.announces,
-        samples: s.samples, ipv6Peers: s.ipv6Peers,
-      } : { running: false, nodes: 0, port: 6881, rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0 },
+        samples: s.samples, ipv6Peers: s.ipv6Peers, utpPeers: s.utpPeers || 0,
+      } : { running: false, nodes: 0, port: 6881, rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0, utpPeers: 0 },
       tracker: this.trackerMgr ? this.trackerMgr.getStats() : null,
       coldStorage: this.coldStorage ? this.coldStorage.getStats() : null,
       recent: this.ring.slice(-30).reverse(),

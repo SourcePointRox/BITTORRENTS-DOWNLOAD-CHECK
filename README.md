@@ -1,6 +1,6 @@
 # BITTORRENTS-DOWNLOAD-CHECK
 
-BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 DHT / PEX / Tracker / P2P 网络，实时监控与采集种子元数据，**全链路 IPv6 支持 + BitTorrent v2 (BEP-52) + 标准 Kademlia K-bucket 路由 + 动态 Tracker 健康检查 + 独立冷存储进程**。
+BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 DHT / PEX / Tracker / P2P 网络，实时监控与采集种子元数据，**全链路 IPv6 支持 + BitTorrent v2 (BEP-52) + 标准 Kademlia K-bucket 路由 + 动态 Tracker 健康检查 + 独立冷存储进程 + 协议加密 (MSE/PE) + uTP (BEP-29) 检测 + TF-IDF + Softmax 分类器**。
 
 零第三方依赖（Node.js ≥ 22.5 标准库 + 内置 `node:sqlite`），可离线启动。
 
@@ -9,6 +9,9 @@ BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 
 - **全网络采集**：DHT (BEP-5/51/52) + PEX (BEP-11) + Tracker (HTTP/UDP, BEP-3/15/7) + BitTorrent P2P (BEP-9/10)
 - **IPv6 全链路**：DHT 双栈 UDP 监听 + PEX `added6` 解析 + Tracker `peers6` (BEP-7) + 元数据 TCP v6 连接
 - **BitTorrent v2 (BEP-52)**：SHA-256 infohash / 64-hex / multihash `btmh` 磁链 / file tree / piece layers / hybrid 混合种子
+- **协议加密 (MSE/PE, BEP-8)**：纯 JS RC4 + 768-bit DH 密钥交换，连接要求加密的 peer，握手失败自动回退明文
+- **uTP 检测 (BEP-29)**：通过 DHT `announce_peer` 的 `implied_port` 标志识别 uTP peer，统计监控面板可见
+- **TF-IDF + Softmax 分类器**：替代纯正则规则，多项逻辑回归 + 混合策略（正则硬规则优先 + ML 处理其余），8 类自动分类
 - **标准 Kademlia 路由**：160 桶 × K=8 LRU 路由表（替代平面 Map），节点 ID 周期性刷新扩大覆盖
 - **动态 Tracker 管理**：自动从 ngosang/trackerslist 拉取远程列表（24h），5 分钟健康检查 + 3 次失败剔除
 - **独立冷存储进程**：分离进程转存种子元数据到独立 SQLite（仅 name/size/magnet/v1/v2），主进程状态可查
@@ -209,14 +212,62 @@ pm2 start scripts/cold-storage-worker.js --name bittorrents-cold
 
 `src/collector/metadata.js` — BitTorrent 元数据
 
-- TCP 连接 peer（**IPv4 和 IPv6**）→ BT 握手 → `ut_metadata` 扩展分片拉取
+- TCP 连接 peer（**IPv4 和 IPv6**）→ **MSE/PE 加密握手** → BT 握手 → `ut_metadata` 扩展分片拉取
 - **握手 reserved bytes 置 BEP-52 v2 支持位**
 - bencode 解析 name / files / **file tree (BEP-52 v2)** / **piece layers**
 - **SHA-1 校验 v1 infohash** / **SHA-256 校验 v2 infohash**
 - v2 种子解析 `meta version=2` 的 file tree 递归结构，提取文件大小
-- 规则引擎分类（Movies / TV / Anime / Music / Games / Software / Books / XXX / Unsorted）
+- **TF-IDF + Softmax 分类**（详见下方"种子分类器"），8 类自动分类
 - **并行 20 peer**（DHT peer 质量参差，并行提高成功率）
 - **重试机制**：每 10 秒对有 peer 但无 metadata 的种子重新解析，优先 announce_peer 真实做种者
+
+### 协议加密 MSE/PE（BEP-8）
+
+`src/collector/mse.js` — Message Stream Encryption / Protocol Encryption
+
+- **768-bit DH 密钥交换**：使用 Node.js `crypto.createDiffieHellman` 与 BEP-8 规定的固定大素数
+- **纯 JS RC4 实现**：Node.js v24 已移除内置 RC4，本模块用 ~30 行 JS 实现 RC4 + RC4-drop（丢弃前 1024 字节输出，安全增强）
+- **MSE 握手流程**（initiator 角色）：
+  1. 生成 DH 密钥对，发送 Y_A（96 字节）
+  2. 接收 Y_B，计算共享密钥 S
+  3. 发送 crypto negotiation：`HASH('req1',S) + HASH('req2',SKEY) XOR HASH('req3',S) + crypto_provide + IA(BT握手)`
+  4. 接收 crypto_select + IB(BT握手)
+  5. 若选择 RC4，后续数据用 RC4 加密
+- **混合支持**：crypto_provide 同时声明 `PLAINTEXT(0x01) | RC4(0x02)`，peer 可任选
+- **自动回退**：MSE 握手超时/失败时，自动回退到明文 BT 握手（`fetchFromPeerAuto`）
+- 集成于 `metadata.js`：`fetchFromPeerMSE` 优先尝试 MSE，失败回退 `_fetchPlaintext`
+
+### uTP 检测（BEP-29）
+
+`src/collector/dht.js` — uTP (Micro Transport Protocol) peer 识别
+
+- **implied_port 标志**：DHT `announce_peer` 消息中 `implied_port=1` 表示 peer 端口应取自 UDP 包源端口（而非 a.port 字段），这是 BEP-29 uTP 客户端的典型行为
+- **被动检测**：在 `announce_peer` 处理路径中检测 `implied_port` 标志，统计 uTP peer 数量
+- **监控可见**：DHT stats 新增 `utpPeers` 字段，监控 WebUI IPv6 面板新增 uTP 计数显示
+
+### 种子分类器（TF-IDF + Softmax）
+
+`src/collector/classifier.js` — 替代纯正则规则的 ML 分类器
+
+- **TF-IDF 向量化器**：
+  - 分词器：lowercase + 非字母数字分割 + 停用词过滤
+  - 特征归一化：4 位年份归一化为 `__year__`、`SxxExx` 归一化为 `__sxxexx__`（避免每个年份/集号作为独立无区分度 token）
+  - bi-gram 特征：相邻 token 配对，提升命名模式识别（如 `web_dl___year__`）
+  - IDF 加权：`ln(N / (1 + df))` + 1 平滑
+  - L2 归一化：稀疏向量归一化
+- **多项逻辑回归（Softmax）**：
+  - 9 类输出：XXX / TV / Anime / Movies / Music / Games / Books / Software / Unsorted
+  - 小批量梯度下降训练（400 epochs，lr=0.6 衰减，L2=0.002）
+  - 稀疏权重矩阵（Float32Array），仅更新非零特征
+- **混合分类策略**（保证准确率 + 泛化能力）：
+  1. **正则硬规则优先**：apk/SxxExx/FitGirl/erai-raws 等强信号直接分类
+  2. **ML 处理其余**：词表命中走 Softmax 预测，取 argmax
+  3. **空向量回退**：词表完全未命中返回 Unsorted
+- **内置训练语料**：8 类 × 15 条精选样本（覆盖主流发布组命名模式），启动时训练 <50ms
+- **API**：
+  - `classify(name)` — 返回类别字符串（与原函数兼容）
+  - `classifyWithConfidence(name)` — 返回 `{ category, confidence, source }`
+  - `retrain()` — 重置单例并重新训练
 
 ### 冷存储进程（独立）
 
@@ -359,12 +410,14 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 ```
 ├── src/
 │   ├── collector/
-│   │   ├── dht.js              # DHT 爬虫（BEP-5/51/52，IPv4+IPv6 双栈，Kademlia K-bucket 路由表）
+│   │   ├── dht.js              # DHT 爬虫（BEP-5/51/52，IPv4+IPv6 双栈，Kademlia K-bucket 路由表，uTP 检测）
 │   │   ├── pex.js              # PEX 采集器（BEP-11 ut_pex，IPv4 added + IPv6 added6）
 │   │   ├── tracker.js          # Tracker 抓取器（HTTP BEP-3 + UDP BEP-15 + BEP-7 peers6 + TrackerManager）
-│   │   ├── metadata.js         # 元数据抓取（BEP-9/10/52，SHA-1/SHA-256 校验，file tree，并行 20 peer）
+│   │   ├── metadata.js         # 元数据抓取（BEP-9/10/52，MSE/PE 加密，SHA-1/SHA-256 校验，file tree，并行 20 peer）
+│   │   ├── mse.js              # 协议加密 MSE/PE（BEP-8，纯 JS RC4 + 768-bit DH 密钥交换）
+│   │   ├── classifier.js       # TF-IDF + Softmax 分类器（混合策略：正则硬规则 + ML）
 │   │   ├── pipeline.js         # 统一采集管道（TTL Map + 写队列批处理 + obs_log TTL）
-│   │   ├── service.js          # 采集服务调度（sim/live 模式 + TrackerManager + 冷存储集成）
+│   │   ├── service.js          # 采集服务调度（sim/live 模式 + TrackerManager + 冷存储集成 + uTP 统计）
 │   │   ├── cold-storage.js     # 冷存储模块（独立 SQLite，name/size/magnet/v1/v2）
 │   │   ├── simulator.js       # 沙箱模拟数据源
 │   │   └── run.js             # 独立采集入口（--dht --tracker --pex）
@@ -423,6 +476,9 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 - **IPv6 全链路**：DHT 双栈 + PEX added6 + Tracker peers6 + TCP v6 元数据连接
 - **BEP-52 完整支持**：SHA-256 / 64-hex / multihash btmh / file tree / piece layers / hybrid 种子
 - **冷存储进程分离**：unref 嵌入或独立 worker，主库只读访问
+- **MSE/PE 协议加密**：纯 JS RC4 + DH 密钥交换，无外部加密库依赖
+- **uTP 被动检测**：复用 DHT announce_peer 的 implied_port 标志，零额外开销
+- **ML 分类器**：TF-IDF + Softmax 纯 JS 实现，无 numpy/tensorflow 依赖
 
 ## 许可与声明
 
@@ -431,16 +487,64 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 ## 技术栈
 
 - Node.js ≥ 22.5（标准库 + `node:sqlite`）
-- BitTorrent 协议：BEP-3 / BEP-5 / BEP-7 / BEP-9 / BEP-10 / BEP-11 / BEP-15 / BEP-23 / BEP-51 / BEP-52
+- BitTorrent 协议：BEP-3 / BEP-5 / BEP-7 / BEP-8 / BEP-9 / BEP-10 / BEP-11 / BEP-15 / BEP-23 / BEP-29 / BEP-51 / BEP-52
 - Kademlia DHT：160 桶 × K=8 LRU 路由表
 - IPv6：双栈 UDP + compact6 peers + TCP v6 + DNS AAAA 并发竞速
+- 协议加密：MSE/PE (BEP-8) + 纯 JS RC4 + 768-bit DH
+- uTP (BEP-29)：基于 DHT implied_port 被动检测
+- ML 分类：TF-IDF + Softmax 多项逻辑回归（纯 JS 实现）
 - GeoIP：ip-api.com batch API（中文返回，三层缓存）
-- 前端：Bootstrap 3 + jQuery + Chart.js（全部本地化）
+- 前端：Bootstrap 5 + Chart.js 4（全部本地化，无 jQuery）
 - 存储：SQLite (WAL 模式) + 独立冷存储 SQLite
 
 ---
 
 ## 更新日志
+
+### v0.4.0 — 2026-07-29
+
+#### 新增
+
+- **协议加密 MSE/PE (BEP-8)**：
+  - 新增 `src/collector/mse.js` 模块，实现 BitTorrent 协议加密握手
+  - 纯 JS RC4 实现（Node.js v24 已移除内置 RC4）+ RC4-drop 安全增强
+  - 768-bit Diffie-Hellman 密钥交换（BEP-8 规定的固定大素数）
+  - MSE 握手四阶段：Y_A 发送 → Y_B 接收计算 S → crypto negotiation → crypto_select + IB
+  - 混合 crypto_provide：同时声明 PLAINTEXT(0x01) | RC4(0x02)，peer 可任选
+  - 元数据抓取集成 `fetchFromPeerMSE`：优先尝试 MSE，失败自动回退明文（`fetchFromPeerAuto`）
+  - 使项目能连接要求强制加密的 BitTorrent 客户端
+
+- **uTP 传输协议检测 (BEP-29)**：
+  - DHT `announce_peer` 消息的 `implied_port=1` 标志识别 uTP peer
+  - DHT stats 新增 `utpPeers` 字段，统计 uTP peer 数量
+  - 监控 WebUI IPv6 面板新增 uTP 计数显示
+  - 零额外网络开销（复用现有 DHT 数据流）
+
+- **TF-IDF + Softmax 种子分类器**：
+  - 新增 `src/collector/classifier.js` 模块，替代纯正则规则
+  - TF-IDF 向量化器：分词 + 停用词过滤 + bi-gram + IDF 加权 + L2 归一化
+  - 特征归一化：年份 → `__year__`、`SxxExx` → `__sxxexx__`（提升泛化）
+  - 多项逻辑回归（Softmax）：9 类输出，400 epochs 训练，L2 正则
+  - 混合分类策略：正则硬规则优先（apk/FitGirl/SxxExx 等）+ ML 处理其余
+  - 内置 8 类 × 15 条精选训练语料，启动训练 <50ms
+  - API：`classify(name)` + `classifyWithConfidence(name)` + `retrain()`
+  - 30/30 单元测试通过，泛化测试 14 条 13/14 正确
+
+- **Anime 正则规则扩展**：
+  - 新增主流动漫发布组：horriblesubs / crunchyroll / commie / doremi / anime-koi / mutiny / pgs / asw / suki
+  - Anime 规则优先于 TV 规则匹配，避免 "Final Season" 等术语被误判为 TV
+
+- **前端堆栈现代化**：
+  - Bootstrap 3.3 → Bootstrap 5（所有组件类名迁移）
+  - Chart.js 2.6 → Chart.js 4（scales 配置 + plugins.legend 重构）
+  - jQuery 1.11 → 原生 JS（vanilla JS 替换所有 jQuery 调用）
+  - 图表更新改用 `chart.update()` 而非 `destroy() + new Chart()`，消除闪动
+
+#### 优化
+
+- **元数据抓取链路**：MSE 优先策略使能连接到强制加密的 peer，提升抓取成功率
+- **uTP peer 识别**：无需额外协议实现，通过 DHT 被动识别
+- **分类准确率提升**：ML 处理 regex 未覆盖的命名模式（如 Linux.Mint.iso、Adobe.After.Effects）
 
 ### v0.3.0 — 2026-07-29
 
