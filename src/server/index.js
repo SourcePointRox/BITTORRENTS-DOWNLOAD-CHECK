@@ -148,7 +148,7 @@ async function handle(req, res) {
   }
   if (pathname === '/en/link/') return html(res, 200, pages.pageLink());
   if (pathname === '/en/stat/daily' || pathname === '/en/stat/daily/') {
-    return html(res, 200, pages.pageStatDaily(q.get('cc') || 'US', q.get('statDate')));
+    return html(res, 200, pages.pageStatDaily(q.get('cc') || 'GL', q.get('statDate')));
   }
   if ((m = pathname.match(/^\/en\/stat\/([A-Za-z]{2})\/daily\/?$/))) {
     return html(res, 200, pages.pageStatDaily(m[1], null));
@@ -159,10 +159,15 @@ async function handle(req, res) {
   if (pathname === '/en/stat/annual' || pathname === '/en/stat/annual/') {
     return html(res, 200, pages.pageStatAnnual(q.get('year')));
   }
-  if ((m = pathname.match(/^\/en\/torrent\/([0-9a-fA-F]{40})(?:\/[^\/]*)?\/?$/))) {
+  // v2 infohash 路由（64 hex）+ v1（40 hex）
+  if ((m = pathname.match(/^\/en\/torrent\/([0-9a-fA-F]{40}|[0-9a-fA-F]{64})(?:\/[^\/]*)?\/?$/))) {
     const body = pages.pageTorrent(m[1].toLowerCase());
     const exists = db.get().prepare('SELECT 1 AS x FROM torrents WHERE infohash=?').get(m[1].toLowerCase());
     return html(res, exists ? 200 : 404, body);
+  }
+  // 冷存储信息页面
+  if (pathname === '/en/cold-storage/' || pathname === '/en/cold-storage') {
+    return html(res, 200, pages.pageColdStorage());
   }
   if (pathname === '/en/api/') return html(res, 200, pages.pageApi());
   if (pathname === '/en/contacts/') return html(res, 200, pages.pageContacts());

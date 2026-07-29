@@ -1,6 +1,7 @@
 'use strict';
-/* 采集服务：运行在站点进程内，统一调度 模拟源 / 真实 DHT / Tracker，
-   维护运行状态与统计，供后台监控 WEBUI 展示。 */
+/* 采集服务：运行在站点进程内，统一调度 模拟源 / 真实 DHT / Tracker / PEX，
+   维护运行状态与统计，供后台监控 WEBUI 展示。
+   集成：冷存储同步、动态 Tracker 健康检查、pipeline 写队列。 */
 const db = require('../server/db');
 const pipeline = require('./pipeline');
 const { DHTSpider } = require('./dht');
@@ -20,6 +21,8 @@ class CollectorService {
     this.simTimer = null;
     this.simIps = [];
     this.trackerTimer = null;
+    this.trackerMgr = null;       // 动态 Tracker 管理器
+    this.coldStorage = null;      // 冷存储同步
     this.metaQueue = [];
     this.metaWorking = 0;
     this.ring = [];               // 最近事件环形缓冲 {ts,ip,infohash,source}
@@ -32,6 +35,7 @@ class CollectorService {
     this.mode = 'sim';
     this.startedAt = Date.now();
     this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0 };
+    pipeline.startPipeline();
     this.simIps = Array.from({ length: opts.ipPool || 2000 }, () => randomPublicIp());
     const intervalMs = opts.intervalMs || 2000;
     const maxPerTick = opts.maxPerTick || 6;
@@ -53,11 +57,11 @@ class CollectorService {
       } catch (_) {}
     }, intervalMs);
     this.simTimer.unref && this.simTimer.unref();
-    // 模拟模式也启动 GeoIP 批量查询（模拟 IP 也需真实解析）
     this.geoFlushTimer = setInterval(() => geo.flushPending(), 5000);
     this.geoFlushTimer.unref && this.geoFlushTimer.unref();
     this.geoBackfillTimer = setInterval(() => geo.backfillCountryDaily(), 30000);
     this.geoBackfillTimer.unref && this.geoBackfillTimer.unref();
+    this._startColdStorage();
     return { mode: this.mode };
   }
 
@@ -65,7 +69,8 @@ class CollectorService {
     this.stop();
     this.mode = 'live';
     this.startedAt = Date.now();
-    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, pexPeers: 0, trackerPeers: 0 };
+    this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, pexPeers: 0, trackerPeers: 0, ipv6Peers: 0 };
+    pipeline.startPipeline();
     pipeline.setMetadataCallback((ih) => this._queueMeta(ih));
     this.spider = new DHTSpider({
       port: opts.dhtPort || 6881,
@@ -78,28 +83,28 @@ class CollectorService {
       },
     });
     this.spider.start();
+    // 动态 Tracker 管理器
     if (opts.tracker) {
+      this.trackerMgr = new tracker.TrackerManager();
+      this.trackerMgr.start();
       this.trackerTimer = setInterval(() => this._harvestSome(), 30000);
       this.trackerTimer.unref && this.trackerTimer.unref();
     }
-    // PEX 采集：定期对活跃种子做 PEX 扩散
     if (opts.pex !== false) {
       this.pexTimer = setInterval(() => this._pexHarvest(), 45000);
       this.pexTimer.unref && this.pexTimer.unref();
     }
-    // 元数据重试：定期对有 peer 但无 metadata 的种子重新解析
     if (opts.retryMeta !== false) {
       this.retryTimer = setInterval(() => this._retryMeta(), 10000);
       this.retryTimer.unref && this.retryTimer.unref();
     }
-    // GeoIP 批量查询：每 5 秒处理待查队列，每 2 小时刷新旧缓存
     this.geoFlushTimer = setInterval(() => geo.flushPending(), 5000);
     this.geoFlushTimer.unref && this.geoFlushTimer.unref();
     this.geoRefreshTimer = setInterval(() => geo.refresh(), 2 * 3600 * 1000);
     this.geoRefreshTimer.unref && this.geoRefreshTimer.unref();
-    // GeoIP 补写：每 30 秒补写之前因占位跳过的 country_daily
     this.geoBackfillTimer = setInterval(() => geo.backfillCountryDaily(), 30000);
     this.geoBackfillTimer.unref && this.geoBackfillTimer.unref();
+    this._startColdStorage();
     return { mode: this.mode };
   }
 
@@ -111,10 +116,21 @@ class CollectorService {
     if (this.geoFlushTimer) { clearInterval(this.geoFlushTimer); this.geoFlushTimer = null; }
     if (this.geoRefreshTimer) { clearInterval(this.geoRefreshTimer); this.geoRefreshTimer = null; }
     if (this.geoBackfillTimer) { clearInterval(this.geoBackfillTimer); this.geoBackfillTimer = null; }
+    if (this.trackerMgr) { this.trackerMgr.stop(); this.trackerMgr = null; }
+    if (this.coldStorage) { this.coldStorage.stop(); this.coldStorage = null; }
     if (this.spider) { this.spider.stop(); this.spider = null; }
     this.mode = 'off';
     this.startedAt = null;
     return { mode: this.mode };
+  }
+
+  /* 冷存储同步启动 */
+  _startColdStorage() {
+    try {
+      const { ColdStorage } = require('./cold-storage');
+      this.coldStorage = new ColdStorage({ pollInterval: 10000 });
+      this.coldStorage.start();
+    } catch (e) { console.log('[cold-storage] 启动失败:', e.message); }
   }
 
   /* ---------- 内部 ---------- */
@@ -122,6 +138,7 @@ class CollectorService {
     const isNew = pipeline.ingest(ev);
     if (isNew) {
       this.counters.ingested++;
+      if (ev.ip && ev.ip.includes(':')) this.counters.ipv6Peers = (this.counters.ipv6Peers || 0) + 1;
       this.ring.push({ ts: ev.ts || Date.now(), ip: ev.ip, infohash: ev.infohash, source: ev.source });
       if (this.ring.length > RING_CAP) this.ring.splice(0, this.ring.length - RING_CAP);
     }
@@ -149,14 +166,9 @@ class CollectorService {
     if (this.metaQueue.length) this._pumpMeta();
   }
 
-  /* 元数据重试：定期对有 peer 但无 metadata 的种子重新解析。
-     DHT 网络中 peer 质量参差，首次解析常因 peer 不可达而失败，
-     积累更多 peer 后重试可显著提升 size 落库率。
-     优先用 announce_peer（dht_passive）的 peer —— 这些是真实声明做种的 peer。 */
   _retryMeta() {
     if (this.metaWorking > 3) return;
     const d = db.get();
-    // 取有 3+ peer 但无 metadata 的种子，优先 announce_peer 来源的
     const row = d.prepare(`
       SELECT t.infohash, COUNT(o.id) AS pc,
         SUM(CASE WHEN o.source = 'dht_passive' THEN 1 ELSE 0 END) AS ap
@@ -172,25 +184,22 @@ class CollectorService {
   }
 
   async _harvestSome() {
-    // 对最近活跃的种子做 tracker harvest，获取真实做种者（比 DHT peer 质量高）
     const rows = db.get().prepare('SELECT infohash FROM torrents ORDER BY last_seen DESC LIMIT 8').all();
     for (const r of rows) {
       try {
         const found = await tracker.harvest(r.infohash, (ev) => this._ingest(ev));
-        this.counters.trackerPeers = (this.counters.trackerPeers || 0) + found;
+        this.counters.trackerPeers = (this.counters.trackerPeers || 0) + (typeof found === 'number' ? found : (found.peers || 0));
       } catch (_) {}
     }
   }
 
-  /* PEX 收集：对最近活跃的种子，取其已知 peer 做 PEX 扩散发现 */
   async _pexHarvest() {
     const d = db.get();
-    // 取最近有观测的种子及其 peer
     const rows = d.prepare(`
       SELECT DISTINCT o.infohash FROM observations o
       JOIN torrents t ON t.infohash = o.infohash
       WHERE o.last_seen > ? ORDER BY o.last_seen DESC LIMIT 3
-    `).all(Date.now() - 600000); // 10 分钟内有观测
+    `).all(Date.now() - 600000);
     for (const r of rows) {
       try {
         const peers = d.prepare('SELECT ip, port FROM obs_log WHERE infohash=? AND port IS NOT NULL ORDER BY id DESC LIMIT 20').all(r.infohash);
@@ -201,7 +210,6 @@ class CollectorService {
     }
   }
 
-  /* 手动注入一批模拟事件（WEBUI 的"立即灌入"按钮） */
   burst(count) {
     const d = db.get();
     const torrents = d.prepare('SELECT infohash FROM torrents').all();
@@ -227,10 +235,10 @@ class CollectorService {
   }
 
   getStats() {
-    const d = db.get();
     const now = Date.now();
     const ratePerMin = this.ring.filter(e => now - e.ts < 60000).length;
     const s = this.spider ? this.spider.stats : null;
+    const dhtNodes = this.spider ? this.spider.routing.size() : 0;
     return {
       mode: this.mode,
       startedAt: this.startedAt,
@@ -246,9 +254,12 @@ class CollectorService {
       counters: this.counters,
       metaQueue: this.metaQueue.length,
       dht: this.spider ? {
-        running: true, nodes: this.spider.nodes.size,
+        running: true, nodes: dhtNodes, port: this.spider.port,
         rx: s.rx, tx: s.tx, peers: s.peers, announces: s.announces,
-      } : { running: false, nodes: 0, rx: 0, tx: 0, peers: 0, announces: 0 },
+        samples: s.samples, ipv6Peers: s.ipv6Peers,
+      } : { running: false, nodes: 0, port: 6881, rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0 },
+      tracker: this.trackerMgr ? this.trackerMgr.getStats() : null,
+      coldStorage: this.coldStorage ? this.coldStorage.getStats() : null,
       recent: this.ring.slice(-30).reverse(),
     };
   }
@@ -256,12 +267,13 @@ class CollectorService {
   getNodes() {
     if (!this.spider) return { nodes: [] };
     const now = Date.now();
-    const nodes = [...this.spider.nodes.values()]
+    const nodes = this.spider.routing.values()
       .sort((a, b) => b.lastSeen - a.lastSeen)
       .slice(0, 100)
       .map(n => ({
         id: n.id.toString('hex').slice(0, 16) + '…',
         address: `${n.host}:${n.port}`,
+        family: n.family || 'ipv4',
         ageSec: Math.floor((now - n.lastSeen) / 1000),
       }));
     return { nodes };

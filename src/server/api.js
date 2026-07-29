@@ -231,8 +231,8 @@ function contentReport(req, res, q, kind) {
 function route(req, res, pathname, query) {
   // 带路径参数的端点
   let m;
-  if ((m = pathname.match(/^\/api\/torrent\/info\/([0-9a-fA-F]{40})\/?$/))) return handlers['GET /api/torrent/info'](req, res, query, m[1].toLowerCase());
-  if ((m = pathname.match(/^\/api\/torrent\/peers\/([0-9a-fA-F]{40})\/?$/))) return handlers['GET /api/torrent/peers'](req, res, query, m[1].toLowerCase());
+  if ((m = pathname.match(/^\/api\/torrent\/info\/([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\/?$/))) return handlers['GET /api/torrent/info'](req, res, query, m[1].toLowerCase());
+  if ((m = pathname.match(/^\/api\/torrent\/peers\/([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\/?$/))) return handlers['GET /api/torrent/peers'](req, res, query, m[1].toLowerCase());
   if ((m = pathname.match(/^\/api\/torrent\/list\/imdb\/(tt\d{5,10})\/?$/))) return handlers['GET /api/torrent/list/imdb'](req, res, query, m[1]);
   const h = handlers[`${req.method} ${pathname}`];
   if (h) return h(req, res, query);

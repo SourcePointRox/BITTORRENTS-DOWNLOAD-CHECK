@@ -98,14 +98,49 @@ function topCountries(limit = 8) {
   return rows.map(r => ({ cc: r.cc, c: r.c }));
 }
 
-/* 元数据解析统计：已解析 size 的种子数 / 总种子数 */
+/* 元数据解析统计：已解析 size 的种子数 / 总种子数 + v1/v2/hybrid 分布 */
 function metaStats() {
   const d = db.get();
   const total = d.prepare('SELECT COUNT(*) AS c FROM torrents').get().c;
   const withMeta = d.prepare('SELECT COUNT(*) AS c FROM torrents WHERE metadata_ok=1').get().c;
   const withSize = d.prepare('SELECT COUNT(*) AS c FROM torrents WHERE size > 0').get().c;
   const withName = d.prepare('SELECT COUNT(*) AS c FROM torrents WHERE name IS NOT NULL').get().c;
-  return { total, withMeta, withSize, withName };
+  // hash_version 分布：1=v1, 2=v2, 3=hybrid
+  const verRows = d.prepare('SELECT hash_version, COUNT(*) AS c FROM torrents GROUP BY hash_version').all();
+  const versions = { v1: 0, v2: 0, hybrid: 0 };
+  for (const r of verRows) {
+    if (r.hash_version === 2) versions.v2 = r.c;
+    else if (r.hash_version === 3) versions.hybrid = r.c;
+    else versions.v1 = r.c;
+  }
+  // 通过 infohash 长度补全 v2 检测（兼容老数据未填 hash_version 的情况）
+  const byLen = d.prepare(`SELECT
+    SUM(CASE WHEN length(infohash)=40 THEN 1 ELSE 0 END) AS v1len,
+    SUM(CASE WHEN length(infohash)=64 THEN 1 ELSE 0 END) AS v2len
+    FROM torrents`).get();
+  if (byLen && byLen.v2len > 0 && versions.v2 === 0 && versions.hybrid === 0) {
+    versions.v2 = byLen.v2len;
+    versions.v1 = byLen.v1len;
+  }
+  // v2 piece layers 落库情况
+  const withPieceLayers = d.prepare('SELECT COUNT(*) AS c FROM torrents WHERE piece_layers_json IS NOT NULL').get().c;
+  const withFileTree = d.prepare('SELECT COUNT(*) AS c FROM torrents WHERE file_tree_json IS NOT NULL').get().c;
+  return { total, withMeta, withSize, withName, versions, withPieceLayers, withFileTree };
+}
+
+/* IPv6 peer 统计：obs_log 中 IPv6 地址数量（按 ip 含冒号判定） */
+function ipv6Stats() {
+  const d = db.get();
+  const since1h = Date.now() - 3600000;
+  const since24h = Date.now() - 86400000;
+  const peers6_1h = d.prepare("SELECT COUNT(DISTINCT ip) AS c FROM obs_log WHERE ts >= ? AND ip LIKE '%:%'").get(since1h).c;
+  const peers6_24h = d.prepare("SELECT COUNT(DISTINCT ip) AS c FROM obs_log WHERE ts >= ? AND ip LIKE '%:%'").get(since24h).c;
+  const peers6_total = d.prepare("SELECT COUNT(DISTINCT ip) AS c FROM obs_log WHERE ip LIKE '%:%'").get().c;
+  const peers4_total = d.prepare("SELECT COUNT(DISTINCT ip) AS c FROM obs_log WHERE ip NOT LIKE '%:%'").get().c;
+  const pct = (peers6_total + peers4_total) > 0
+    ? (peers6_total * 100 / (peers6_total + peers4_total)).toFixed(2)
+    : '0.00';
+  return { peers6_1h, peers6_24h, peers6_total, peers4_total, pct: Number(pct) };
 }
 
 function fmtDay(ts) {
@@ -157,9 +192,18 @@ async function handle(req, res) {
     s.sources = sourceBreakdown();
     s.topCountries = topCountries(8);
     s.meta = metaStats();
+    s.ipv6 = ipv6Stats();
     s.system = systemMetrics();
     s.health = healthScore(s);
     s.sitePort = sitePort;
+    // 已通过 TrackerManager 收集到的 tracker 详情列表（top 20 按延迟升序）
+    if (s.tracker && collectorRef && collectorRef.trackerMgr) {
+      try {
+        s.trackerList = collectorRef.trackerMgr.getTopTrackers(20);
+      } catch (_) { s.trackerList = []; }
+    } else {
+      s.trackerList = [];
+    }
     // 速率统计
     const vals = s.perMinute.map(b => b.c).filter(c => c > 0);
     s.peakRate = vals.length ? Math.max(...vals) : 0;
@@ -380,6 +424,95 @@ function dashboardHtml() {
     </div>
   </div>
 
+  <!-- IPv6 + v2 + 冷存储 + Tracker 四面板 -->
+  <div class="grid grid-4" style="margin-top:12px">
+    <div class="card">
+      <div class="card-title"><span>IPv6 采集统计</span><span id="ipv6Pct" style="color:#3fb950;font-weight:600">0%</span></div>
+      <div class="mini-grid" style="margin-top:8px">
+        <div class="mini-stat"><div class="l">v6 peer 总数</div><div class="v" id="v6Total">0</div></div>
+        <div class="mini-stat"><div class="l">v4 peer 总数</div><div class="v" id="v4Total">0</div></div>
+        <div class="mini-stat"><div class="l">v6 (1h)</div><div class="v" id="v6_1h">0</div></div>
+        <div class="mini-stat"><div class="l">v6 (24h)</div><div class="v" id="v6_24h">0</div></div>
+      </div>
+      <div style="margin-top:8px">
+        <div class="l" style="font-size:10px;color:#54626f">IPv6 占比</div>
+        <div class="progress-bar"><div class="progress-fill" id="ipv6Bar" style="width:0%;background:linear-gradient(90deg,#1f6feb,#58a6ff)"></div></div>
+      </div>
+      <div style="margin-top:6px;font-size:11px;color:#54626f">DHT 直接捕获 <span id="dhtV6Peers" style="color:#58a6ff">0</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span>Info Hash v2 (BEP-52)</span><span id="v2Pct" style="color:#d29922;font-weight:600">0%</span></div>
+      <div class="mini-grid" style="margin-top:8px">
+        <div class="mini-stat"><div class="l">v1 种子</div><div class="v" id="v1Count">0</div></div>
+        <div class="mini-stat"><div class="l">v2 种子</div><div class="v" id="v2Count" style="color:#d29922">0</div></div>
+        <div class="mini-stat"><div class="l">hybrid 种子</div><div class="v" id="hybridCount" style="color:#d29922">0</div></div>
+        <div class="mini-stat"><div class="l">piece layers</div><div class="v" id="pieceLayers">0</div></div>
+      </div>
+      <div style="margin-top:8px">
+        <div class="l" style="font-size:10px;color:#54626f">v2 落库率</div>
+        <div class="progress-bar"><div class="progress-fill" id="v2Bar" style="width:0%;background:linear-gradient(90deg,#bb8009,#d29922)"></div></div>
+      </div>
+      <div style="margin-top:6px;font-size:11px;color:#54626f">file tree <span id="fileTree">0</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span>冷存储状态</span><span id="coldRunning" style="color:#f85149">未启动</span></div>
+      <div class="mini-grid" style="margin-top:8px">
+        <div class="mini-stat"><div class="l">冷库总数</div><div class="v" id="coldTotal">0</div></div>
+        <div class="mini-stat"><div class="l">已同步</div><div class="v" id="coldSynced" style="color:#3fb950">0</div></div>
+        <div class="mini-stat"><div class="l">待同步</div><div class="v" id="coldPending" style="color:#d29922">0</div></div>
+        <div class="mini-stat"><div class="l">同步率</div><div class="v" id="coldRate">0%</div></div>
+      </div>
+      <div style="margin-top:8px;font-size:10px;color:#54626f">数据库路径：</div>
+      <div id="coldPath" class="mono" style="font-size:10px;color:#7d8a99;word-break:break-all;margin-top:2px">—</div>
+      <div style="margin-top:6px;font-size:11px;color:#54626f">最近同步 <span id="coldLastSync">—</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span>Tracker 健康度</span><span id="trkAlive" style="color:#3fb950;font-weight:600">0/0</span></div>
+      <div class="mini-grid" style="margin-top:8px">
+        <div class="mini-stat"><div class="l">总 tracker</div><div class="v" id="trkTotal">0</div></div>
+        <div class="mini-stat"><div class="l">存活</div><div class="v" id="trkAliveCount" style="color:#3fb950">0</div></div>
+        <div class="mini-stat"><div class="l">死亡</div><div class="v" id="trkDead" style="color:#f85149">0</div></div>
+        <div class="mini-stat"><div class="l">平均延迟</div><div class="v" id="trkAvgLat">0ms</div></div>
+      </div>
+      <div style="margin-top:8px;font-size:10px;color:#54626f">存活率</div>
+      <div class="progress-bar"><div class="progress-fill" id="trkBar" style="width:0%;background:linear-gradient(90deg,#238636,#3fb950)"></div></div>
+      <div style="margin-top:6px;font-size:11px;color:#54626f">详情见下方列表</div>
+    </div>
+  </div>
+
+  <!-- 冷存储详情 + Tracker 详情 -->
+  <div class="grid grid-2" style="margin-top:12px">
+    <div class="card">
+      <div class="card-title"><span>Tracker 详情（按延迟升序）</span><span id="trkListCount" style="color:#54626f"></span></div>
+      <div class="scroll" style="max-height:280px">
+      <table>
+        <thead><tr><th>Tracker URL</th><th>状态</th><th>延迟</th><th>失败</th></tr></thead>
+        <tbody id="trkListBody"><tr><td colspan="4" style="color:#54626f;text-align:center;padding:20px">未启动</td></tr></tbody>
+      </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">采集器综合统计</div>
+      <div class="mini-grid" style="margin-top:8px">
+        <div class="mini-stat"><div class="l">会话累计</div><div class="v" id="ingestedCount">0</div></div>
+        <div class="mini-stat"><div class="l">本次新增</div><div class="v" id="newTorrents2">0</div></div>
+        <div class="mini-stat"><div class="l">DHT announce</div><div class="v" id="dhtAnn">0</div></div>
+        <div class="mini-stat"><div class="l">DHT sample</div><div class="v" id="dhtSmp">0</div></div>
+      </div>
+      <div style="margin-top:8px">
+        <div class="l" style="font-size:10px;color:#54626f">DHT 收发流量</div>
+        <div id="dhtTraffic" class="mono" style="font-size:11px;color:#7d8a99;margin-top:2px">rx 0 / tx 0</div>
+      </div>
+      <div style="margin-top:6px">
+        <div class="l" style="font-size:10px;color:#54626f">采集模式 / 端口</div>
+        <div id="modeDetail" class="mono" style="font-size:11px;color:#7d8a99;margin-top:2px">—</div>
+      </div>
+    </div>
+  </div>
+
   <!-- 实时事件流 + DHT 路由表 + 系统资源 -->
   <div class="grid grid-3" style="margin-top:12px">
     <div class="card">
@@ -580,6 +713,88 @@ function renderStats(s) {
     mc.data.datasets[0].data = memHistory;
     mc.update();
   }
+
+  // IPv6 统计面板
+  if (s.ipv6) {
+    var v6 = s.ipv6;
+    document.getElementById('v6Total').textContent = fmt(v6.peers6_total);
+    document.getElementById('v4Total').textContent = fmt(v6.peers4_total);
+    document.getElementById('v6_1h').textContent = fmt(v6.peers6_1h);
+    document.getElementById('v6_24h').textContent = fmt(v6.peers6_24h);
+    document.getElementById('ipv6Pct').textContent = v6.pct + '%';
+    document.getElementById('ipv6Bar').style.width = Math.min(100, v6.pct) + '%';
+  }
+  document.getElementById('dhtV6Peers').textContent = fmt(s.dht.ipv6Peers || 0);
+
+  // v2 / BEP-52 统计面板
+  if (s.meta && s.meta.versions) {
+    var vv = s.meta.versions;
+    document.getElementById('v1Count').textContent = fmt(vv.v1);
+    document.getElementById('v2Count').textContent = fmt(vv.v2);
+    document.getElementById('hybridCount').textContent = fmt(vv.hybrid);
+    document.getElementById('pieceLayers').textContent = fmt(s.meta.withPieceLayers || 0);
+    document.getElementById('fileTree').textContent = fmt(s.meta.withFileTree || 0);
+    var v2Total = vv.v2 + vv.hybrid;
+    var v2Rate = s.meta.total > 0 ? (v2Total * 100 / s.meta.total) : 0;
+    document.getElementById('v2Pct').textContent = v2Rate.toFixed(1) + '%';
+    document.getElementById('v2Bar').style.width = Math.min(100, v2Rate) + '%';
+  }
+
+  // 冷存储面板
+  var cs = s.coldStorage;
+  var csEl = document.getElementById('coldRunning');
+  if (cs && cs.running) {
+    csEl.textContent = '运行中';
+    csEl.style.color = '#3fb950';
+    document.getElementById('coldTotal').textContent = fmt(cs.total || 0);
+    document.getElementById('coldSynced').textContent = fmt(cs.synced || 0);
+    document.getElementById('coldPending').textContent = fmt(cs.pending || 0);
+    var csRate = (cs.total && cs.total > 0)
+      ? Math.round((cs.total - cs.pending) * 100 / cs.total) : 0;
+    document.getElementById('coldRate').textContent = csRate + '%';
+    document.getElementById('coldPath').textContent = cs.dbPath || '—';
+    document.getElementById('coldLastSync').textContent = cs.lastSync ? fmtTime(cs.lastSync) : '—';
+  } else {
+    csEl.textContent = '未启动';
+    csEl.style.color = '#f85149';
+  }
+
+  // Tracker 健康度面板
+  var trk = s.tracker;
+  if (trk) {
+    document.getElementById('trkTotal').textContent = fmt(trk.total || 0);
+    document.getElementById('trkAliveCount').textContent = fmt(trk.alive || 0);
+    document.getElementById('trkDead').textContent = fmt(trk.dead || 0);
+    document.getElementById('trkAvgLat').textContent = (trk.avgLatency || 0) + 'ms';
+    document.getElementById('trkAlive').textContent = fmt(trk.alive || 0) + '/' + fmt(trk.total || 0);
+    var trkRate = trk.total > 0 ? (trk.alive * 100 / trk.total) : 0;
+    document.getElementById('trkBar').style.width = trkRate + '%';
+  }
+
+  // Tracker 详情列表
+  var tlBody = document.getElementById('trkListBody');
+  var tlCount = document.getElementById('trkListCount');
+  var tl = s.trackerList || [];
+  tlCount.textContent = tl.length ? ('(' + tl.length + ' 条)') : '';
+  if (!tl.length) {
+    tlBody.innerHTML = '<tr><td colspan="4" style="color:#54626f;text-align:center;padding:20px">未启动 TrackerManager</td></tr>';
+  } else {
+    tlBody.innerHTML = tl.map(function(t) {
+      var st = t.alive === true ? '<span style="color:#3fb950">存活</span>'
+        : t.alive === false ? '<span style="color:#f85149">死亡</span>'
+        : '<span style="color:#7d8a99">未检</span>';
+      var lat = t.latency > 0 ? (t.latency + 'ms') : '—';
+      return '<tr><td class="mono" style="word-break:break-all">' + esc(t.url) + '</td><td>' + st + '</td><td class="mono">' + lat + '</td><td class="mono">' + (t.fails||0) + '</td></tr>';
+    }).join('');
+  }
+
+  // 采集器综合统计面板
+  document.getElementById('ingestedCount').textContent = fmt(s.counters.ingested || 0);
+  document.getElementById('newTorrents2').textContent = fmt(s.counters.newTorrents || 0);
+  document.getElementById('dhtAnn').textContent = fmt(s.dht.announces || 0);
+  document.getElementById('dhtSmp').textContent = fmt(s.dht.samples || 0);
+  document.getElementById('dhtTraffic').textContent = 'rx ' + fmt(s.dht.rx || 0) + ' / tx ' + fmt(s.dht.tx || 0);
+  document.getElementById('modeDetail').textContent = s.mode.toUpperCase() + ' / UDP ' + (s.dht.port || 6881);
 }
 
 function renderNodes(d) {

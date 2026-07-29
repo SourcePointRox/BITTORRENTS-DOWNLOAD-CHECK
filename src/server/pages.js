@@ -289,19 +289,29 @@ function absoluteUrl(p) {
 /* ---------- 3. 日统计页 ---------- */
 function pageStatDaily(cc, day) {
   const d = db.get();
-  cc = (cc || 'US').toUpperCase();
+  cc = (cc || 'GL').toUpperCase();
   const latest = latestDay();
   day = day || latest;
   const prev = fmtDay(Date.parse(day + 'T00:00:00Z') - 86400000);
   const nextDate = Date.parse(day + 'T00:00:00Z') + 86400000;
   const next = nextDate < Date.parse(latest + 'T00:00:00Z') + 86400000 ? fmtDay(nextDate) : null;
 
-  const peersToday = d.prepare('SELECT peers FROM country_daily WHERE cc=? AND day=?').get(cc, day);
-  const peers = peersToday ? peersToday.peers : 0;
-  const popMln = geo.populationOf(cc);
-  const penetration = geo.penetrationOf(cc);
-  const perMillion = popMln ? Math.round(peers / (popMln * 1e6) * 1e6) : 0;
-  const pctInternetUsers = popMln ? (peers / (popMln * 1e6 * penetration) * 100) : 0;
+  // GL = Global（全球汇总，非单一国家）
+  const isGlobal = cc === 'GL';
+  let peers = 0, perMillion = 0, pctInternetUsers = 0;
+  if (isGlobal) {
+    peers = d.prepare('SELECT COALESCE(SUM(peers),0) AS p FROM country_daily WHERE day=?').get(day).p;
+    const totalPop = 8000; // 全球人口约 80 亿
+    perMillion = Math.round(peers / (totalPop * 1e6) * 1e6);
+    pctInternetUsers = (peers / (totalPop * 1e6 * 0.65) * 100); // 全球约 65% 网络普及率
+  } else {
+    const peersToday = d.prepare('SELECT peers FROM country_daily WHERE cc=? AND day=?').get(cc, day);
+    peers = peersToday ? peersToday.peers : 0;
+    const popMln = geo.populationOf(cc);
+    const penetration = geo.penetrationOf(cc);
+    perMillion = popMln ? Math.round(peers / (popMln * 1e6) * 1e6) : 0;
+    pctInternetUsers = popMln ? (peers / (popMln * 1e6 * penetration) * 100) : 0;
+  }
 
   // 饼图：该国家当日各类别下载（简化为全局类别分布，与官网视觉一致）
   const pieRows = d.prepare('SELECT category, downloads FROM daily_stats WHERE day=? ORDER BY downloads DESC').all(day);
@@ -374,11 +384,14 @@ ${topList(cat) || '                            <li><span class="grey-text">No da
   const countryOptions = geo.allCountries().map(c =>
     `<li><a href="/en/stat/${c.cc}/daily">${esc(c.country)}</a></li>`).join('\n                        ');
 
+  // 国家名显示：GL 显示 Global
+  const displayName = isGlobal ? 'Global' : geo.countryName(cc);
+
   const content = `
     <div class="row">
         <div class="column-md-12">
             <h3 class="paddingBottom">Daily Torrents Statistics in
-                <a href="#" data-toggle="modal" data-target="#countryModal">${esc(geo.countryName(cc))}</a>
+                <a href="#" data-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
                 for
                 ${day > prev ? '' : ''}<small><a class="countryLink" href="/en/stat/${cc}/daily/q?statDate=${prev}">${prev}</a></small>
                 <a href="#" data-toggle="modal" data-target="#dayModal">${day}</a>
@@ -418,7 +431,7 @@ ${topList(cat) || '                            <li><span class="grey-text">No da
 
     <div class="row">
         <div class="column-md-12">
-            <h3 class="paddingBottom">Top 12 Movies in <a href="#" data-toggle="modal" data-target="#countryModal">${esc(geo.countryName(cc))}</a>
+            <h3 class="paddingBottom">Top 12 Movies in <a href="#" data-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
                 for ${day}</h3>
         </div>
     </div>
@@ -428,7 +441,7 @@ ${posterWall('Movies') || '<p class="grey-text left15">No movie data for this da
 
     <div class="row">
         <div class="column-md-12">
-            <h3 class="paddingBottom paddingTop">Top 12 Series in <a href="#" data-toggle="modal" data-target="#countryModal">${esc(geo.countryName(cc))}</a>
+            <h3 class="paddingBottom paddingTop">Top 12 Series in <a href="#" data-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
                 for ${day}</h3>
         </div>
     </div>
@@ -498,7 +511,7 @@ function onFilterCountry() {
 </script>`;
 
   return layout({
-    title: `Daily Torrents Statistics in ${geo.countryName(cc)} for ${day}`,
+    title: `Daily Torrents Statistics in ${displayName} for ${day}`,
     description: 'Daily bittorrent download statistics',
     content, bodyExtra,
   });

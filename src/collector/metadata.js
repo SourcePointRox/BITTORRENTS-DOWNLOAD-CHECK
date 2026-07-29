@@ -1,13 +1,15 @@
 'use strict';
-/* 元数据抓取器（BEP-9 / BEP-10）：
-   TCP 连接 peer → BitTorrent 握手 → 协商 ut_metadata 扩展 → 分片拉取 info 字典 →
-   bencode 解析 name/files → SHA-1 校验 infohash → pipeline.upsertTorrentMeta。 */
+/* 元数据抓取器（BEP-9 / BEP-10 / BEP-52）：
+   TCP 连接 peer → BitTorrent 握手（置 BEP-52 v2 支持位）→ 协商 ut_metadata 扩展 →
+   分片拉取 info 字典 → bencode 解析 name/files/file tree →
+   SHA-1 校验 v1 infohash / SHA-256 校验 v2 infohash → pipeline.upsertTorrentMeta。
+   支持 IPv4 和 IPv6 peer。 */
 const net = require('net');
 const crypto = require('crypto');
 const bencode = require('../common/bencode');
 const { decodeWithNext } = bencode;
 const pipeline = require('./pipeline');
-const { normalizeInfohash } = require('../common/util');
+const { normalizeInfohash, isV2Infohash, sha256hex } = require('../common/util');
 
 const PSTR = Buffer.from('BitTorrent protocol');
 const EXT_HANDSHAKE_ID = 0;
@@ -37,6 +39,28 @@ function parseInfo(infoRaw) {
   const name = info['name.utf-8'] ? info['name.utf-8'].toString('utf8')
     : info.name ? info.name.toString('utf8') : null;
   let size = 0; const files = [];
+  const isV2 = info['meta version'] === 2;
+
+  if (isV2 && info['file tree']) {
+    // BEP-52 v2: 递归遍历 file tree 提取文件
+    const walkTree = (tree, pathParts) => {
+      for (const [key, val] of Object.entries(tree)) {
+        if (key === '' && val.length !== undefined) {
+          // 叶节点：文件属性 { length, pieces root, ... }
+          files.push({ path: pathParts.join('/'), size: val.length || 0 });
+          size += val.length || 0;
+        } else if (typeof val === 'object' && val !== null) {
+          // 子目录
+          walkTree(val, [...pathParts, key]);
+        }
+      }
+    };
+    walkTree(info['file tree'], []);
+    // v2 的 piece layers（可选，存储为原始数据）
+    return { name, size, files, isV2: true, fileTree: info['file tree'], pieceLayers: info['piece layers'] };
+  }
+
+  // v1: files 列表或单文件
   if (Array.isArray(info.files)) {
     for (const f of info.files) {
       const parts = (f['path.utf-8'] || f.path || []).map(p => p.toString('utf8'));
@@ -47,7 +71,7 @@ function parseInfo(infoRaw) {
     size = info.length;
     files.push({ path: name, size });
   }
-  return { name, size, files };
+  return { name, size, files, isV2: false };
 }
 
 /* 从单个 peer 拉取元数据。返回 Promise<Buffer|null>（info 原始字节） */
@@ -73,8 +97,14 @@ function fetchFromPeer(ip, port, infohashHex) {
     }
 
     sock.connect(port, ip, () => {
-      const reserved = Buffer.alloc(8); reserved[5] = 0x10; // 支持扩展协议 (BEP-10)
-      const hs = Buffer.concat([Buffer.from([19]), PSTR, reserved, infohash, peerId]);
+      const reserved = Buffer.alloc(8);
+      reserved[5] = 0x10; // 支持扩展协议 (BEP-10)
+      reserved[7] = 0x10; // 支持 BitTorrent v2 / Hybrid (BEP-52)
+      // infohash 字段：v2 用截断的 20 字节（SHA-256 前 20 字节）
+      const ihForHandshake = isV2Infohash(infohashHex)
+        ? Buffer.from(infohashHex.slice(0, 40), 'hex')
+        : infohash;
+      const hs = Buffer.concat([Buffer.from([19]), PSTR, reserved, ihForHandshake, peerId]);
       sock.write(hs);
     });
     sock.on('error', () => { clearTimeout(timer); done(null); });
@@ -89,7 +119,9 @@ function fetchFromPeer(ip, port, infohashHex) {
           // infohash 起始 = 1 + pstrlen + 8 = 28
           const ihStart = 1 + pstrlen + 8;
           const gotHash = buffer.slice(ihStart, ihStart + 20);
-          if (!gotHash.equals(infohash)) { clearTimeout(timer); return done(null); }
+          // v2: 用截断的 20 字节比较；v1: 直接比较
+          const expectedHash = isV2Infohash(infohashHex) ? ihForHandshake : infohash;
+          if (!gotHash.equals(expectedHash)) { clearTimeout(timer); return done(null); }
           buffer = buffer.slice(1 + pstrlen + 48); hsDone = true; // 跳过整个握手 (1+pstr+8+20+20)
           // 发送扩展握手
           sendExt(EXT_HANDSHAKE_ID, bencode.encode({ m: { ut_metadata: UT_METADATA_ID }, metadata_size: 0, v: 'ikwyd-sandbox/0.1' }));
@@ -144,11 +176,13 @@ setInterval(() => {
   diag.conn = diag.hs = diag.sha = diag.noname = diag.ok = diag.total = 0;
 }, 30000).unref();
 
-/* 元数据解析并入库：并行尝试多个 peer（DHT peer 质量参差，并行提高成功率） */
+/* 元数据解析并入库：并行尝试多个 peer（DHT peer 质量参差，并行提高成功率）。
+   v1: SHA-1 校验；v2: SHA-256 校验。 */
 async function resolveAndStore(infohashHex, peersList) {
   const infohash = normalizeInfohash(infohashHex);
   if (!infohash) return null;
-  // 并行尝试最多 20 个 peer，取第一个 SHA-1 匹配的结果
+  const isV2 = isV2Infohash(infohash);
+  // 并行尝试最多 20 个 peer，取第一个 hash 匹配的结果
   const candidates = peersList.slice(0, 20);
   diag.total += candidates.length;
   const tasks = candidates.map(p =>
@@ -159,7 +193,10 @@ async function resolveAndStore(infohashHex, peersList) {
     if (r.status !== 'fulfilled' || !r.value || !r.value.raw) { diag.conn++; continue; }
     const raw = r.value.raw;
     if (raw.length < 1) { diag.conn++; continue; }
-    const hash = crypto.createHash('sha1').update(raw).digest('hex');
+    // v1: SHA-1(20字节/40hex); v2: SHA-256(32字节/64hex)
+    const hash = isV2
+      ? crypto.createHash('sha256').update(raw).digest('hex')
+      : crypto.createHash('sha1').update(raw).digest('hex');
     if (hash !== infohash) {
       diag.sha++;
       if (diag.debug < 5) { diag.debug++; console.log('[meta-debug] SHA mismatch', infohash.slice(0,12), 'got', hash.slice(0,12), 'len', raw.length); }
@@ -168,8 +205,13 @@ async function resolveAndStore(infohashHex, peersList) {
     const meta = parseInfo(raw);
     if (!meta.name) { diag.noname++; continue; }
     pipeline.upsertTorrentMeta({
-      infohash, name: meta.name, size: meta.size, files: meta.files,
-      category: classify(meta.name), metadata_ok: 1, first_seen: Date.now(), last_seen: Date.now(),
+      infohash,
+      hash_version: isV2 ? 2 : 1,
+      name: meta.name, size: meta.size, files: meta.files,
+      category: classify(meta.name), metadata_ok: 1,
+      first_seen: Date.now(), last_seen: Date.now(),
+      piece_layers: meta.pieceLayers,
+      file_tree: meta.fileTree,
     });
     diag.ok++;
     return meta;

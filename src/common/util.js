@@ -1,9 +1,11 @@
 'use strict';
-/* 通用工具：哈希、编码、格式化、校验 */
+/* 通用工具：哈希、编码、格式化、校验。支持 BitTorrent v1 (SHA-1/20字节) 与 v2 (SHA-256/32字节) */
 const crypto = require('crypto');
 
 function sha1(buf) { return crypto.createHash('sha1').update(buf).digest(); }
 function sha1hex(buf) { return crypto.createHash('sha1').update(buf).digest('hex'); }
+function sha256(buf) { return crypto.createHash('sha256').update(buf).digest(); }
+function sha256hex(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
 function randomBytes(n) { return crypto.randomBytes(n); }
 function randomHex(n) { return crypto.randomBytes(n).toString('hex'); }
 
@@ -19,12 +21,21 @@ function base32Encode(buf) {
   return out;
 }
 
-/* infohash 规范化：接受 40hex / 32base32 / 64hex(BTMH 取前40?) —— 统一返回 40 位小写 hex；非法返回 null */
+/* infohash 版本检测：40 hex = v1，64 hex = v2 */
+function isV2Infohash(h) {
+  return typeof h === 'string' && /^[0-9a-fA-F]{64}$/.test(h.trim());
+}
+
+/* infohash 规范化：接受 40hex(v1) / 32base32(v1) / 64hex(v2) —— 统一返回小写 hex；非法返回 null */
 function normalizeInfohash(h) {
   if (!h || typeof h !== 'string') return null;
   h = h.trim();
+  // v2: 64 hex (SHA-256)
+  if (/^[0-9a-fA-F]{64}$/.test(h)) return h.toLowerCase();
+  // v1: 40 hex (SHA-1)
   if (/^[0-9a-fA-F]{40}$/.test(h)) return h.toLowerCase();
-  if (/^[A-Z2-7]{32}$/i.test(h)) { // base32 -> hex
+  // v1: 32 base32
+  if (/^[A-Z2-7]{32}$/i.test(h)) {
     const map = {}; for (let i = 0; i < 32; i++) map[B32[i]] = i;
     let bits = 0, value = 0; const out = [];
     for (const c of h.toUpperCase()) {
@@ -36,15 +47,25 @@ function normalizeInfohash(h) {
   return null;
 }
 
-/* 生成 magnet URI（v1）。name 可选 */
-function magnetURI(infohash, name) {
-  let m = 'magnet:?xt=urn:btih:' + infohash;
+/* 生成 magnet URI。自动判断 v1(btih) / v2(btmh multihash)。name 可选。
+   v2 的 btmh 格式: urn:btmh:1220 + 64 hex (0x12=SHA-256算法码, 0x20=32字节长度) */
+function magnetURI(infohash, name, opts = {}) {
+  let xt;
+  if (isV2Infohash(infohash)) {
+    xt = 'urn:btmh:1220' + infohash; // multihash: 0x12=SHA-256, 0x20=32 bytes
+  } else {
+    xt = 'urn:btih:' + infohash;
+  }
+  let m = 'magnet:?xt=' + xt;
+  // 混合种子：同时携带 v1 和 v2
+  if (opts.infohashV1 && isV2Infohash(infohash)) {
+    m += '&xt=urn:btih:' + opts.infohashV1;
+  }
   if (name) m += '&dn=' + encodeURIComponent(name);
-  // 公共 tracker 便于一键打开即可开始获取元数据
   const trackers = [
-    'udp://tracker.openbittorrent.com:6969/announce',
     'udp://tracker.opentrackr.org:1337/announce',
     'udp://open.stealth.si:80/announce',
+    'udp://exodus.desync.com:6969/announce',
   ];
   for (const t of trackers) m += '&tr=' + encodeURIComponent(t);
   return m;
@@ -81,6 +102,29 @@ function isIPv4(ip) {
 function ipToInt(ip) { return ip.split('.').reduce((a, o) => (a << 8) + Number(o), 0) >>> 0; }
 function intToIp(n) { return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'); }
 
+/* IPv6 校验 */
+function isIPv6(ip) {
+  if (typeof ip !== 'string' || !ip.includes(':')) return false;
+  // 简化校验：至少两个冒号段，字符为 hex 和冒号
+  const parts = ip.split(':');
+  if (parts.length < 3) return false;
+  // 允许 :: 简写
+  return parts.every(p => p === '' || /^[0-9a-fA-F]{1,4}$/.test(p));
+}
+
+/* 判断 IP 是 v4 还是 v6 */
+function ipFamily(ip) {
+  return isIPv6(ip) ? 'ipv6' : isIPv4(ip) ? 'ipv4' : null;
+}
+
+/* 格式化 IPv6 地址为标准形式（展开 16 字节 buffer） */
+function formatIPv6(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length !== 16) return '';
+  const parts = [];
+  for (let i = 0; i < 16; i += 2) parts.push(buf.readUInt16BE(i).toString(16));
+  return parts.join(':');
+}
+
 /* HTML 转义 */
 function esc(s) {
   return String(s == null ? '' : s)
@@ -98,7 +142,7 @@ function slugify(name) {
 }
 
 module.exports = {
-  sha1, sha1hex, randomBytes, randomHex, base32Encode,
-  normalizeInfohash, magnetURI, formatSize, fmtUTC, fmtDay,
-  isIPv4, ipToInt, intToIp, esc, slugify,
+  sha1, sha1hex, sha256, sha256hex, randomBytes, randomHex, base32Encode,
+  normalizeInfohash, isV2Infohash, magnetURI, formatSize, fmtUTC, fmtDay,
+  isIPv4, isIPv6, ipFamily, ipToInt, intToIp, formatIPv6, esc, slugify,
 };

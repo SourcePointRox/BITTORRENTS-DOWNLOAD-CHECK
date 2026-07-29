@@ -63,6 +63,7 @@ function pexFromPeer(ip, port, infohashHex, opts = {}) {
     sock.connect(port, ip, () => {
       const reserved = Buffer.alloc(8);
       reserved[5] = 0x10; // 支持扩展协议 (BEP-10)
+      reserved[7] = 0x10; // 支持 BitTorrent v2 / Hybrid (BEP-52)
       const hs = Buffer.concat([Buffer.from([19]), PSTR, reserved, infohash, peerId]);
       sock.write(hs);
     });
