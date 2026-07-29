@@ -28,16 +28,15 @@ function initializeClock(id, endtime) {
 
 function checkVisited(token) {
     function check() {
-        var request = $.ajax({
-            type: "GET",
-            url: "/link/check/" + token,
-            success: function (data) {
+        fetch('/link/check/' + token)
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
                 if (data.visited) {
                     location.reload();
                     clearInterval(timeinterval);
                 }
-            }
-        });
+            })
+            .catch(function () {});
     }
     check();
     var timeinterval = setInterval(check, 30000);

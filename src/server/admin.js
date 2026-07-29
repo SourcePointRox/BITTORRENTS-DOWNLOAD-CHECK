@@ -93,9 +93,8 @@ function dashboardHtml() {
 <title>IKWYD Collector Admin</title>
 <link rel="stylesheet" href="/assets/css/bootstrap.min.css">
 <link rel="stylesheet" href="/assets/css/font-awesome.min.css">
-<script src="/assets/js/jquery.min.js"></script>
-<script src="/assets/js/bootstrap.min.js"></script>
-<script src="/assets/js/chart.bundle.min.js"></script>
+<script src="/assets/js/bootstrap.bundle.min.js"></script>
+<script src="/assets/js/chart.umd.min.js"></script>
 <style>
   body { background: #0f1419; color: #d7dde4; font-family: "Segoe UI", Arial, sans-serif; }
   .topbar { display: flex; align-items: center; justify-content: space-between; padding: 14px 22px; background: #161d27; border-bottom: 1px solid #232c38; }
@@ -128,7 +127,7 @@ function dashboardHtml() {
   .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .pulse-on { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
   .pulse-off { background: #555; }
-  .form-inline .form-control { background: #0f1419; border: 1px solid #2a3542; color: #d7dde4; }
+  .d-flex .form-control { background: #0f1419; border: 1px solid #2a3542; color: #d7dde4; }
 </style>
 </head>
 <body>
@@ -136,20 +135,20 @@ function dashboardHtml() {
   <h1><i class="fa fa-satellite-dish"></i>IKWYD Collector Admin</h1>
   <div>
     <span id="modeBadge" class="badge-mode badge-off">OFF</span>
-    <a class="btn btn-default btn-xs" href="/" target="_blank" style="margin-left:10px"><i class="fa fa-external-link"></i> 打开站点</a>
+    <a class="btn btn-light btn-sm" href="/" target="_blank" style="margin-left:10px"><i class="fa fa-external-link"></i> 打开站点</a>
   </div>
 </div>
 
 <div class="container-fluid">
   <!-- 控制 -->
   <div class="card">
-    <div class="form-inline">
+    <div class="d-flex align-items-center flex-wrap gap-2">
       <span class="pulse pulse-off" id="pulse"></span><span id="uptime" class="grey-text">collector stopped</span>
-      <span style="float:right">
+      <span class="ms-auto">
         <button class="btn btn-success btn-sm btn-ctl" onclick="ctl('start-sim')"><i class="fa fa-play"></i> 启动模拟采集</button>
         <button class="btn btn-warning btn-sm btn-ctl" onclick="ctl('start-live')"><i class="fa fa-broadcast-tower"></i> 启动真实 DHT 采集</button>
         <button class="btn btn-danger btn-sm btn-ctl" onclick="ctl('stop')"><i class="fa fa-stop"></i> 停止</button>
-        <input type="number" id="burstCount" class="form-control input-sm" value="200" style="width:90px" min="1" max="100000">
+        <input type="number" id="burstCount" class="form-control form-control-sm" value="200" style="width:90px" min="1" max="100000">
         <button class="btn btn-info btn-sm" onclick="burst()"><i class="fa fa-bolt"></i> 立即灌入</button>
       </span>
     </div>
@@ -220,7 +219,7 @@ function renderCards(s) {
     ['DHT 捕获', dht.running ? fmtNum(dht.peers + dht.announces) : '—', dht.running ? ('peers ' + fmtNum(dht.peers) + ' / announce ' + fmtNum(dht.announces)) : '元数据队列 ' + s.metaQueue],
   ];
   document.getElementById('statCards').innerHTML = cards.map(function (c) {
-    return '<div class="col-xs-6 col-sm-4 col-md-2"><div class="card"><div class="stat-num">' + c[1] +
+    return '<div class="col-6 col-sm-4 col-md-2"><div class="card"><div class="stat-num">' + c[1] +
       '</div><div class="stat-label">' + c[0] + '</div><div class="stat-sub">' + (c[2] || '&nbsp;') + '</div></div></div>';
   }).join('');
 
@@ -232,27 +231,52 @@ function renderCards(s) {
   document.getElementById('uptime').textContent = s.mode === 'off' ? 'collector stopped' : ('running ' + s.uptimeSec + 's · 元数据已解析 ' + s.counters.metaResolved + ' / 失败 ' + s.counters.metaFailed);
 }
 
+var CHART_OPTS = {
+  line: {
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 400 },
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { ticks: { color: '#7d8a99', maxTicksLimit: 10 }, grid: { color: '#1c2530' } },
+      y: { ticks: { color: '#7d8a99', beginAtZero: true }, grid: { color: '#1c2530' } }
+    }
+  },
+  doughnut: {
+    responsive: true, maintainAspectRatio: false,
+    animation: { duration: 400 },
+    plugins: { legend: { position: 'bottom', labels: { color: '#9fb0c0', boxWidth: 12, font: { size: 11 } } } }
+  }
+};
+
 function renderCharts(s) {
   var labels = s.perMinute.map(function (b) { return fmtTime(b.t).slice(0, 5); });
   var data = s.perMinute.map(function (b) { return b.c; });
-  if (rateChart) { rateChart.destroy(); }
-  rateChart = new Chart(document.getElementById('rateChart').getContext('2d'), {
-    type: 'line',
-    data: { labels: labels, datasets: [{ label: 'events/min', data: data, borderColor: '#36a2eb', backgroundColor: 'rgba(54,162,235,0.12)', fill: true, pointRadius: 0, borderWidth: 1.5 }] },
-    options: {
-      responsive: true, maintainAspectRatio: false, legend: { display: false },
-      scales: { xAxes: [{ ticks: { fontColor: '#7d8a99', maxTicksLimit: 10 }, gridLines: { color: '#1c2530' } }], yAxes: [{ ticks: { fontColor: '#7d8a99', beginAtZero: true }, gridLines: { color: '#1c2530' } }] }
-    }
-  });
+  if (rateChart) {
+    rateChart.data.labels = labels;
+    rateChart.data.datasets[0].data = data;
+    rateChart.update();
+  } else {
+    rateChart = new Chart(document.getElementById('rateChart').getContext('2d'), {
+      type: 'line',
+      data: { labels: labels, datasets: [{ label: 'events/min', data: data, borderColor: '#36a2eb', backgroundColor: 'rgba(54,162,235,0.12)', fill: true, pointRadius: 0, borderWidth: 1.5 }] },
+      options: CHART_OPTS.line
+    });
+  }
   var sl = s.sources.map(function (x) { return x.source + ' (' + x.c + ')'; });
   var sd = s.sources.map(function (x) { return x.c; });
   var sc = s.sources.map(function (x) { return SRC_COLORS[x.source] || '#c9cbcf'; });
-  if (srcChart) { srcChart.destroy(); }
-  srcChart = new Chart(document.getElementById('srcChart').getContext('2d'), {
-    type: 'doughnut',
-    data: { labels: sl, datasets: [{ data: sd, backgroundColor: sc }] },
-    options: { responsive: true, maintainAspectRatio: false, legend: { position: 'bottom', labels: { fontColor: '#9fb0c0', boxWidth: 12, fontSize: 11 } } }
-  });
+  if (srcChart) {
+    srcChart.data.labels = sl;
+    srcChart.data.datasets[0].data = sd;
+    srcChart.data.datasets[0].backgroundColor = sc;
+    srcChart.update();
+  } else {
+    srcChart = new Chart(document.getElementById('srcChart').getContext('2d'), {
+      type: 'doughnut',
+      data: { labels: sl, datasets: [{ data: sd, backgroundColor: sc }] },
+      options: CHART_OPTS.doughnut
+    });
+  }
 }
 
 function renderRecent(s) {

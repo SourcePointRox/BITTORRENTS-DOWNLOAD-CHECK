@@ -1,5 +1,5 @@
 'use strict';
-/* SSR 页面层：与 iknowwhatyoudownload.com 页面结构/样式对齐（Bootstrap 3 体系），
+/* SSR 页面层：与 iknowwhatyoudownload.com 页面结构/样式对齐（Bootstrap 5 体系），
    并在 peer/torrent 页增强展示 infohash / magnet / 最早记录发布时间。 */
 const db = require('./db');
 const geo = require('./geo');
@@ -15,54 +15,46 @@ function layout({ title, description, content, headExtra = '', bodyExtra = '' })
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="/assets/css/bootstrap.min.css">
-<link rel="stylesheet" href="/assets/css/bootstrap-theme.min.css">
 <link rel="stylesheet" href="/assets/css/font-awesome.min.css">
 <link href="/assets/css/v2.css" rel="stylesheet">
 <link rel="icon" type="image/svg+xml" href="/assets/img/logo.svg" />
-<script src="/assets/js/jquery.min.js"></script>
-<script src="/assets/js/bootstrap.min.js"></script>
-<script src="/assets/js/chart.bundle.min.js"></script>
+<script src="/assets/js/bootstrap.bundle.min.js"></script>
+<script src="/assets/js/chart.umd.min.js"></script>
 <script src="/assets/js/iknow.js"></script>
 <meta http-equiv="content-type" content="text/html;charset=UTF-8">
 ${headExtra}</head>
 <body>
 <script>
-    $(document).ready(function() {
-        $('a[href="' + this.location.pathname + '"]').parent().addClass('active');
+    document.addEventListener('DOMContentLoaded', function() {
+        var path = this.location.pathname;
+        document.querySelectorAll('.navbar-nav .nav-link').forEach(function(a) {
+            if (a.getAttribute('href') === path) a.classList.add('active');
+        });
     });
 </script>
-<nav class="navbar navbar-default" itemscope itemtype="http://www.schema.org/SiteNavigationElement">
+<nav class="navbar navbar-expand-lg navbar-light bg-light" itemscope itemtype="http://www.schema.org/SiteNavigationElement">
     <div class="container-fluid">
-        <div class="navbar-header">
-            <a class="navbar-brand" href="/">
-                <img alt="Brand" src="/assets/img/logo.svg" width="110" height="24">
-            </a>
-            <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#bs-example-navbar-collapse-1" aria-expanded="false">
-                <span class="sr-only">Toggle navigation</span>
-                <span class="icon-bar"></span>
-                <span class="icon-bar"></span>
-                <span class="icon-bar"></span>
-            </button>
-        </div>
-        <div class="collapse navbar-collapse" id="bs-example-navbar-collapse-1">
-            <ul class="nav navbar-nav">
-                <li itemprop="name"><a itemprop="url" href="/en/peer/">IP Info</a></li>
-                <li itemprop="name"><a itemprop="url" href="/en/link/">Track Downloads</a></li>
-                <li itemprop="name"><a itemprop="url" href="/en/stat/daily">Daily Statistics</a></li>
-                <li itemprop="name"><a itemprop="url" href="/en/stat/annual">Annual Statistics</a></li>
-                <li itemprop="name"><a itemprop="url" href="/en/api/">API</a></li>
-                <li itemprop="name"><a itemprop="url" href="/en/contacts/">About Us</a></li>
+        <a class="navbar-brand" href="/">
+            <img alt="Brand" src="/assets/img/logo.svg" width="110" height="24">
+        </a>
+        <button type="button" class="navbar-toggler collapsed" data-bs-toggle="collapse" data-bs-target="#mainNavbar" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="mainNavbar">
+            <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/peer/">IP Info</a></li>
+                <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/link/">Track Downloads</a></li>
+                <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/stat/daily">Daily Statistics</a></li>
+                <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/stat/annual">Annual Statistics</a></li>
+                <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/api/">API</a></li>
+                <li class="nav-item" itemprop="name"><a class="nav-link" itemprop="url" href="/en/contacts/">About Us</a></li>
             </ul>
-            <form class="navbar-form navbar-left" action="/en/peer/">
-                <div class="form-group">
-                    <input type="text" class="form-control" placeholder="127.0.0.1" name="ip">
-                </div>
-                <button type="submit" class="btn btn-default">Find IP</button>
+            <form class="d-flex" role="search" action="/en/peer/">
+                <input type="text" class="form-control me-2" placeholder="127.0.0.1" name="ip">
+                <button type="submit" class="btn btn-light">Find IP</button>
             </form>
-            <ul class="nav navbar-nav navbar-right">
-                <li><a id="lang" href="#">
-                    <span class="bfh-languages" data-language="ru_RU" data-flags="true">RU</span>
-                </a></li>
+            <ul class="navbar-nav ms-auto">
+                <li class="nav-item"><a class="nav-link" id="lang" href="#">RU</a></li>
             </ul>
         </div><!-- /.navbar-collapse -->
     </div><!-- /.container-fluid -->
@@ -75,7 +67,7 @@ ${content}
     <div class="container">
         <div class="row"></div>
         <div class="row">
-            <div class="col-xs-12">
+            <div class="col-12">
                 <p>
                 <div class="col-md-12 text-center">
                     <a class="twitter-follow-button" href="https://twitter.com/iknowtorrents" data-size="large">Follow Us</a>
@@ -94,18 +86,18 @@ ${bodyExtra}
 const MAGNET_ICON = '<i class="fa fa-magnet"></i>';
 
 function copyBtn(text, title) {
-  return `<button class="btn btn-default btn-xs magnet-btn" data-clipboard="${esc(text)}" title="${esc(title || 'Copy magnet link')}">${MAGNET_ICON}</button>`;
+  return `<button class="btn btn-light btn-sm magnet-btn" data-clipboard="${esc(text)}" title="${esc(title || 'Copy magnet link')}">${MAGNET_ICON}</button>`;
 }
 
 function hashCell(infohash) {
   return `<span class="infohash hash-cell" title="${infohash}">${infohash.slice(0, 12)}&hellip;</span>` +
-    `<button class="btn btn-default btn-xs hash-copy" data-clipboard="${infohash}" title="Copy infohash"><i class="fa fa-clipboard"></i></button>`;
+    `<button class="btn btn-light btn-sm hash-copy" data-clipboard="${infohash}" title="Copy infohash"><i class="fa fa-clipboard"></i></button>`;
 }
 
 function geoLabels(g) {
   return [g.continent, g.country, g.city, g.isp]
     .filter(Boolean)
-    .map(x => `<span class="label label-primary">${esc(x)}</span>`)
+    .map(x => `<span class="badge bg-primary">${esc(x)}</span>`)
     .join('\n                    ');
 }
 
@@ -170,8 +162,8 @@ function pagePeer(ip, visitorIp) {
 
   const content = `
     <div class="row">
-        <div class="panel panel-default col-md-12">
-            <div class="panel-body" itemscope itemtype="http://schema.org/Table">
+        <div class="card col-md-12">
+            <div class="card-body" itemscope itemtype="http://schema.org/Table">
                 <div>
                     <h3 itemprop="about">Torrent downloads and distributions for IP ${esc(ip)}</h3>
                 </div>
@@ -194,7 +186,7 @@ IP addresses consist of four numbers in the range 0-255 separated by periods (i.
 
                 <div class="padding-block">
 ${empty}
-<table class="table table-condensed table-striped">
+<table class="table table-sm table-striped">
     <thead class="header-torrents">
     <tr>
         <th title="UTC datetime when we saw user sharing torrent first time">First seen (UTC)</th>
@@ -225,19 +217,19 @@ ${tableRows}
 /* ---------- 2. Track Downloads ---------- */
 function pageLink(generated) {
   const content = `
-<div class="panel panel-default col-md-12">
-    <div class="panel-body">
+<div class="card col-md-12">
+    <div class="card-body">
         <div>
             <h2>Track downloads</h2>
         </div>
         <form class="padding-block" method="post" action="/en/link/">
             <div class="form-group">
-                <div class="col-xs-7">
+                <div class="col-7">
                     <input type="url" class="form-control" id="link" name="url"
                            placeholder="Link to share with your friend (f.e., http://facebook.com)">
                 </div>
-                <div class="col-xs-2">
-                    <button type="submit" class="btn btn-default">Transform</button>
+                <div class="col-2">
+                    <button type="submit" class="btn btn-light">Transform</button>
                 </div>
             </div>
         </form>
@@ -263,7 +255,7 @@ function pageLinkResult(token, targetUrl) {
         <div class="padding-block col-md-12">
             <div class="alert alert-success">
                 <p>Send this link to your friend: <a class="bold-links" href="${link}" target="_blank" id="spyLink">${esc(absoluteUrl(link))}</a>
-                <button class="btn btn-default btn-xs" data-clipboard="${esc(absoluteUrl(link))}"><i class="fa fa-clipboard"></i></button></p>
+                <button class="btn btn-light btn-sm" data-clipboard="${esc(absoluteUrl(link))}"><i class="fa fa-clipboard"></i></button></p>
                 <p class="grey-text">Waiting for visit... this page refreshes automatically when the link is opened.</p>
                 <div id="visitResult"></div>
             </div>
@@ -298,7 +290,7 @@ function pageStatDaily(cc, day) {
 
   // GL = Global（全球汇总，非单一国家）
   const isGlobal = cc === 'GL';
-  let peers = 0, perMillion = 0, pctInternetUsers = 0;
+  let peers = 0, perMillion = 0, pctInternetUsers = 0, penetration = 0.65;
   if (isGlobal) {
     peers = d.prepare('SELECT COALESCE(SUM(peers),0) AS p FROM country_daily WHERE day=?').get(day).p;
     const totalPop = 8000; // 全球人口约 80 亿
@@ -308,7 +300,7 @@ function pageStatDaily(cc, day) {
     const peersToday = d.prepare('SELECT peers FROM country_daily WHERE cc=? AND day=?').get(cc, day);
     peers = peersToday ? peersToday.peers : 0;
     const popMln = geo.populationOf(cc);
-    const penetration = geo.penetrationOf(cc);
+    penetration = geo.penetrationOf(cc);
     perMillion = popMln ? Math.round(peers / (popMln * 1e6) * 1e6) : 0;
     pctInternetUsers = popMln ? (peers / (popMln * 1e6 * penetration) * 100) : 0;
   }
@@ -346,8 +338,8 @@ function pageStatDaily(cc, day) {
                             </li>`).join('\n                            ');
   }
   const tabsNav = TABS.map(([id, label], i) =>
-    `<li class="nav-item${i === 0 ? ' active' : ''}">
-                    <a class="nav-link" data-toggle="tab" href="#${id}" role="tab">${label}</a>
+    `<li class="nav-item">
+                    <a class="nav-link${i === 0 ? ' active' : ''}" data-bs-toggle="tab" href="#${id}" role="tab">${label}</a>
                 </li>`).join('\n                ');
   const tabsBody = TABS.map(([id, , cat], i) =>
     `<div class="tab-pane${i === 0 ? ' active' : ''}" id="${id}" role="tabpanel">
@@ -365,7 +357,7 @@ ${topList(cat) || '                            <li><span class="grey-text">No da
       GROUP BY t.imdb_id ORDER BY peers DESC LIMIT 12`)
       .all(Date.parse(day + 'T00:00:00Z'), Date.parse(day + 'T00:00:00Z') + 86400000, cat);
     return rows.map(r => `
-            <div class="col-xs-6 col-sm-4 col-md-3 col-lg-2 col-xl-2">
+            <div class="col-6 col-sm-4 col-md-3 col-lg-2 col-xl-2">
                 <figure class="paddingBottom">
                     <a href="https://www.imdb.com/title/${esc(r.imdb_id)}/" rel="nofollow" target="_blank">
                         <div class="img-container">
@@ -389,37 +381,37 @@ ${topList(cat) || '                            <li><span class="grey-text">No da
 
   const content = `
     <div class="row">
-        <div class="column-md-12">
+        <div class="col-md-12">
             <h3 class="paddingBottom">Daily Torrents Statistics in
-                <a href="#" data-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
+                <a href="#" data-bs-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
                 for
                 ${day > prev ? '' : ''}<small><a class="countryLink" href="/en/stat/${cc}/daily/q?statDate=${prev}">${prev}</a></small>
-                <a href="#" data-toggle="modal" data-target="#dayModal">${day}</a>
+                <a href="#" data-bs-toggle="modal" data-target="#dayModal">${day}</a>
                 ${next ? `<small><a class="countryLink" href="/en/stat/${cc}/daily/q?statDate=${next}">${next}</a></small>` : ''}
             </h3>
         </div>
     </div>
 
     <div class="row paddingBottom">
-            <div class="col-xs-12 col-sm-4 col-md-4 col-lg-3">
+            <div class="col-12 col-sm-4 col-md-4 col-lg-3">
                 <span class="usePercent">${perMillion}</span><br/>
                 <span>per million population download Torrents daily</span>
             </div>
-            <div class="col-xs-12 col-sm-4 col-md-4 col-lg-3">
+            <div class="col-12 col-sm-4 col-md-4 col-lg-3">
                 <span class="usePercent">${(penetration * 100).toFixed(2)}%</span><br/>
                 <span>of population have Internet</span>
             </div>
-            <div class="col-xs-12 col-sm-4 col-md-4 col-lg-3">
+            <div class="col-12 col-sm-4 col-md-4 col-lg-3">
                 <span class="usePercent">${pctInternetUsers.toFixed(2)}%</span><br/>
                 <span>of Internet users download Torrents daily</span>
             </div>
     </div>
 
     <div class="row">
-        <div class="col-xs-12 col-sm-6 col-md-4 col-lg-4">
+        <div class="col-12 col-sm-6 col-md-4 col-lg-4">
             <canvas id="chart-area"></canvas>
         </div>
-        <div class="col-xs-12 col-sm-12 col-md-8 col-lg-8">
+        <div class="col-12 col-sm-12 col-md-8 col-lg-8">
             <ul class="nav nav-pills" role="tablist">
                 ${tabsNav}
             </ul>
@@ -430,8 +422,8 @@ ${topList(cat) || '                            <li><span class="grey-text">No da
     </div>
 
     <div class="row">
-        <div class="column-md-12">
-            <h3 class="paddingBottom">Top 12 Movies in <a href="#" data-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
+        <div class="col-md-12">
+            <h3 class="paddingBottom">Top 12 Movies in <a href="#" data-bs-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
                 for ${day}</h3>
         </div>
     </div>
@@ -440,8 +432,8 @@ ${posterWall('Movies') || '<p class="grey-text left15">No movie data for this da
     </div>
 
     <div class="row">
-        <div class="column-md-12">
-            <h3 class="paddingBottom paddingTop">Top 12 Series in <a href="#" data-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
+        <div class="col-md-12">
+            <h3 class="paddingBottom paddingTop">Top 12 Series in <a href="#" data-bs-toggle="modal" data-target="#countryModal">${esc(displayName)}</a>
                 for ${day}</h3>
         </div>
     </div>
@@ -453,7 +445,7 @@ ${posterWall('TV') || '<p class="grey-text left15">No series data for this day</
     <div class="modal fade" id="countryModal" tabindex="-1" role="dialog">
       <div class="modal-dialog" role="document">
         <div class="modal-content">
-          <div class="modal-header"><button type="button" class="close" data-dismiss="modal">&times;</button>
+          <div class="modal-header"><button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             <h4 class="modal-title">Choose country</h4></div>
           <div class="modal-body">
             <input type="text" class="form-control" id="filterCountry" placeholder="Filter" onkeyup="onFilterCountry()">
@@ -468,7 +460,7 @@ ${posterWall('TV') || '<p class="grey-text left15">No series data for this day</
     <div class="modal fade" id="dayModal" tabindex="-1" role="dialog">
       <div class="modal-dialog" role="document">
         <div class="modal-content">
-          <div class="modal-header"><button type="button" class="close" data-dismiss="modal">&times;</button>
+          <div class="modal-header"><button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             <h4 class="modal-title">Choose date</h4></div>
           <div class="modal-body">
             <form method="get" action="/en/stat/${cc}/daily/q">
@@ -483,7 +475,7 @@ ${posterWall('TV') || '<p class="grey-text left15">No series data for this day</
   const bodyExtra = `
 <script>
 window.chartColors = { blue: '#36a2eb', red: '#ff6384', orange: '#ff9f40', green: '#4bc0c0', purple: '#9966ff', grey: '#c9cbcf' };
-$(function () {
+document.addEventListener('DOMContentLoaded', function () {
     var ctx = document.getElementById("chart-area").getContext("2d");
     var config = {
         type: 'pie',
@@ -495,7 +487,7 @@ $(function () {
             }],
             labels: ${JSON.stringify(pieLabels)}
         },
-        options: { responsive: true, legend: { display: true, position: 'top' } }
+        options: { responsive: true, plugins: { legend: { display: true, position: 'top' } } }
     };
     new Chart(ctx, config);
 });
@@ -538,7 +530,7 @@ function pageStatAnnual(year) {
 
   const content = `
     <div class="row">
-        <div class="column-md-12">
+        <div class="col-md-12">
             <h3 class="paddingBottom">Annual Torrents Statistics for ${year}</h3>
         </div>
     </div>
@@ -549,7 +541,7 @@ function pageStatAnnual(year) {
     </div>
     <div class="row top15">
         <div class="col-md-12">
-<table class="table table-condensed table-striped">
+<table class="table table-sm table-striped">
     <thead class="header-torrents"><tr><th>Month</th>${head}<th>Total</th></tr></thead>
     <tbody>
 ${body}
@@ -559,7 +551,7 @@ ${body}
     </div>`;
   const bodyExtra = `
 <script>
-$(function () {
+document.addEventListener('DOMContentLoaded', function () {
     new Chart(document.getElementById("annual-chart").getContext("2d"), {
         type: 'bar',
         data: {
@@ -570,7 +562,7 @@ $(function () {
                 backgroundColor: '#36a2eb'
             }]
         },
-        options: { responsive: true, legend: { display: true, position: 'top' }, scales: { yAxes: [{ ticks: { beginAtZero: true } }] } }
+        options: { responsive: true, plugins: { legend: { display: true, position: 'top' } }, scales: { y: { beginAtZero: true } } }
     });
 });
 </script>`;
@@ -609,30 +601,30 @@ function pageTorrent(infohash) {
     const files = JSON.parse(t.files_json);
     filesHtml = files.map(f => `<tr><td class="torTree"></td><td class="name-column">${esc(f.path)}</td><td class="size-column">${formatSize(f.size)}</td></tr>`).join('\n');
     filesHtml = `<h4 class="paddingTop">Files (${files.length})</h4>
-    <table class="table table-condensed torrentFileList"><tbody>${filesHtml}</tbody></table>`;
+    <table class="table table-sm torrentFileList"><tbody>${filesHtml}</tbody></table>`;
   }
 
   const content = `
     <div class="row">
-        <div class="panel panel-default col-md-12">
-            <div class="panel-body">
+        <div class="card col-md-12">
+            <div class="card-body">
                 <h3>${esc(t.name || t.infohash)}</h3>
                 <div>
-                    <span class="label label-primary">${esc(g.category)}</span>
-                    ${t.title ? `<span class="label label-info">${esc(t.title)}</span>` : ''}
-                    ${t.imdb_id ? `<a href="https://www.imdb.com/title/${esc(t.imdb_id)}/" target="_blank" rel="nofollow"><span class="label label-success">IMDB ${esc(t.imdb_id)}</span></a>` : ''}
-                    <span class="label ${t.alive ? 'label-success' : 'label-default'}">${t.alive ? 'alive' : 'dead'}</span>
+                    <span class="badge bg-primary">${esc(g.category)}</span>
+                    ${t.title ? `<span class="badge bg-info">${esc(t.title)}</span>` : ''}
+                    ${t.imdb_id ? `<a href="https://www.imdb.com/title/${esc(t.imdb_id)}/" target="_blank" rel="nofollow"><span class="badge bg-success">IMDB ${esc(t.imdb_id)}</span></a>` : ''}
+                    <span class="badge ${t.alive ? 'bg-success' : 'bg-secondary'}">${t.alive ? 'alive' : 'dead'}</span>
                 </div>
 
                 <div class="padding-block">
-                    <table class="table table-borderless table-condensed torrent-props">
+                    <table class="table table-borderless table-sm torrent-props">
                         <tr><td class="grey-text">Size</td><td><b>${formatSize(t.size)}</b></td></tr>
                         <tr><td class="grey-text">Info hash</td><td><span class="infohash">${t.infohash}</span>
-                            <button class="btn btn-default btn-xs" data-clipboard="${t.infohash}"><i class="fa fa-clipboard"></i></button></td></tr>
+                            <button class="btn btn-light btn-sm" data-clipboard="${t.infohash}"><i class="fa fa-clipboard"></i></button></td></tr>
                         <tr><td class="grey-text">Magnet link</td><td>
                             <div class="input-group magnet-box">
                               <input type="text" class="form-control input-sm" readonly value="${esc(magnet)}" onclick="this.select()">
-                              <span class="input-group-btn">${copyBtn(magnet, 'Copy magnet link')}</span>
+                              <span class="input-group-append">${copyBtn(magnet, 'Copy magnet link')}</span>
                             </div></td></tr>
                         <tr><td class="grey-text">First recorded (published)</td><td title="Earliest time this torrent was recorded in the network"><b>${fmtUTC(t.first_seen)}</b> (UTC)</td></tr>
                         <tr><td class="grey-text">Last seen</td><td>${fmtUTC(t.last_seen)} (UTC)</td></tr>
@@ -646,7 +638,7 @@ function pageTorrent(infohash) {
 
                 <div class="padding-block">
                     <h4>Recent peers (${peers.length})</h4>
-<table class="table table-condensed table-striped">
+<table class="table table-sm table-striped">
     <thead class="header-torrents"><tr>
         <th>IP</th><th>Country</th><th>City</th><th>Last seen (UTC)</th><th>Hits</th>
     </tr></thead>
@@ -662,7 +654,7 @@ ${peerRows}
     </div>`;
   const bodyExtra = COPY_SCRIPT + `
 <script>
-$(function () {
+document.addEventListener('DOMContentLoaded', function () {
     new Chart(document.getElementById("peers-chart").getContext("2d"), {
         type: 'line',
         data: {
@@ -673,7 +665,7 @@ $(function () {
                 borderColor: '#36a2eb', backgroundColor: 'rgba(54,162,235,0.15)', fill: true, pointRadius: 2
             }]
         },
-        options: { responsive: true, legend: { display: true, position: 'top' }, scales: { yAxes: [{ ticks: { beginAtZero: true } }] } }
+        options: { responsive: true, plugins: { legend: { display: true, position: 'top' } }, scales: { y: { beginAtZero: true } } }
     });
 });
 </script>`;
@@ -687,11 +679,11 @@ $(function () {
 /* ---------- 6. API 页 ---------- */
 function pageApi() {
   const content = `
-    <div class="panel panel-info">
-        <div class="panel-heading">Cooperation</div>
-        <div class="panel-body">
+    <div class="card border-info">
+        <div class="card-header">Cooperation</div>
+        <div class="card-body">
             <div class="row">
-                <div class="col-lg-12 col-md-12 col-sm-12 col-xs-12">
+                <div class="col-lg-12 col-md-12 col-sm-12 col-12">
                     <p>
                         We cooperate with Right Holders, Law Offices, Internet Service Providers, Advertising Agencies
                         and National Police.
@@ -734,7 +726,7 @@ function pageApi() {
                     </p>
                 </div>
 
-                <div class="col-lg-12 col-md-12 col-sm-12 col-xs-12 top10">
+                <div class="col-lg-12 col-md-12 col-sm-12 col-12 top10">
                     <form method="post" id="demoKeyForm" action="/en/createKey">
                         <div class="form-group">
                             <label for="exampleInputEmail1">Email address</label>
@@ -750,12 +742,20 @@ function pageApi() {
         </div>
     </div>
 <script>
-$(document).ready(function () {
-    $('#demoKeyForm').submit(function (event) {
+document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('demoKeyForm').addEventListener('submit', function (event) {
         event.preventDefault();
-        $.post('/en/createKey', { email: $('#email').val() }, function (data) {
-            $('#keyResult').html('<div class="alert alert-' + (data.success ? 'success' : 'warning') + '">' + data.message + '</div>');
-        }, 'json');
+        var email = document.getElementById('email').value;
+        fetch('/en/createKey', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'email=' + encodeURIComponent(email)
+        }).then(function (r) { return r.json(); }).then(function (data) {
+            document.getElementById('keyResult').innerHTML =
+                '<div class="alert alert-' + (data.success ? 'success' : 'warning') + '">' + data.message + '</div>';
+        }).catch(function () {
+            document.getElementById('keyResult').innerHTML = '<div class="alert alert-danger">Request failed</div>';
+        });
     });
 });
 </script>`;
@@ -765,9 +765,9 @@ $(document).ready(function () {
 /* ---------- 7. About Us ---------- */
 function pageContacts() {
   const content = `
-    <div class="panel panel-info">
-        <div class="panel-heading">About Us</div>
-        <div class="panel-body">
+    <div class="card border-info">
+        <div class="card-header">About Us</div>
+        <div class="card-body">
             <p>We monitor the BitTorrent network and collect publicly available data about content distribution.</p>
             <p>This sandbox build mirrors the functionality of the original service and additionally exposes
                torrent <b>info hashes</b>, <b>magnet links</b> and the <b>earliest recorded publish time</b> of every resource,
@@ -782,9 +782,9 @@ function pageContacts() {
 function page404(msg) {
   const content = `
     <div class="row">
-        <div class="panel panel-info">
-            <div class="panel-heading">Page not found</div>
-            <div class="panel-body">
+        <div class="card border-info">
+            <div class="card-header">Page not found</div>
+            <div class="card-body">
                 <p>${esc(msg || 'Page not found')}, but you can check your IP <a href="/en/peer/">here</a>.</p>
             </div>
         </div>

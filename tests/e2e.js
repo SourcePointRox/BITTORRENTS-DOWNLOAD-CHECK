@@ -109,7 +109,7 @@ async function main() {
 
   const peerPage = await getText(`/en/peer/?ip=${busyIp}`);
   ok('peer 页标题', peerPage.text.includes(`Torrent downloads and distributions for IP ${busyIp}`));
-  ok('peer 页地理标签', peerPage.text.includes('label label-primary'));
+  ok('peer 页地理标签', peerPage.text.includes('badge bg-primary'));
   ok('peer 页含 Info hash 列', peerPage.text.includes('Info hash'));
   ok('peer 页含 Magnet 列', peerPage.text.includes('>Magnet<'));
   ok('peer 页含 Published (UTC) 列（最早记录发布时间）', peerPage.text.includes('Published (UTC)'));

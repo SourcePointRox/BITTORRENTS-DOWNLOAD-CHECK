@@ -551,7 +551,7 @@ function dashboardHtml() {
 
 <div class="footer">BITTORRENTS Network Monitor · DHT + PEX + Tracker + P2P 全网络接入 · 自动刷新 2s · 平滑过渡</div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@2.9.4/dist/Chart.min.js"></script>
+<script src="/assets/js/chart.umd.min.js"></script>
 <script>
 var rateChart = null, memChart = null;
 var curMins = 60;
@@ -591,13 +591,12 @@ function ensureRateChart() {
     }) },
     options: {
       responsive: true, maintainAspectRatio: false,
-      legend: { display: false },
+      plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
       animation: { duration: 400, easing: 'easeOutQuart' },
       scales: {
-        xAxes: [{ ticks: { fontColor: '#7d8a99', maxTicksLimit: 8, fontSize: 10 }, gridLines: { color: '#1c2530' } }],
-        yAxes: [{ stacked: true, ticks: { fontColor: '#7d8a99', beginAtZero: true, fontSize: 10 }, gridLines: { color: '#1c2530' } }]
-      },
-      tooltips: { mode: 'index', intersect: false }
+        x: { ticks: { color: '#7d8a99', maxTicksLimit: 8, font: { size: 10 } }, grid: { color: '#1c2530' } },
+        y: { stacked: true, ticks: { color: '#7d8a99', beginAtZero: true, font: { size: 10 } }, grid: { color: '#1c2530' } }
+      }
     }
   });
   // 图例
@@ -613,7 +612,7 @@ function ensureMemChart() {
   memChart = new Chart(ctx, {
     type: 'line',
     data: { labels: [], datasets: [{ data: [], borderColor: '#d29922', backgroundColor: 'rgba(210,153,34,0.15)', fill: true, pointRadius: 0, borderWidth: 1 }] },
-    options: { responsive: true, maintainAspectRatio: false, legend: { display: false }, animation: { duration: 400 }, scales: { xAxes: [{ display: false }], yAxes: [{ ticks: { fontColor: '#7d8a99', fontSize: 9, callback: function(v){ return (v/1048576).toFixed(0)+'M'; } }, gridLines: { color: '#1c2530' } }] } }
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, animation: { duration: 400 }, scales: { x: { display: false }, y: { ticks: { color: '#7d8a99', font: { size: 9 }, callback: function(v){ return (v/1048576).toFixed(0)+'M'; } }, grid: { color: '#1c2530' } } } }
   });
   return memChart;
 }

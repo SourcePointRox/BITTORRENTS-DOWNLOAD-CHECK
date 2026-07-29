@@ -105,7 +105,7 @@ console.log('== 5. DHT 爬虫离线行为 ==');
   responded = null;
   spider._onMessage(bencode.encode(ping), { address: '198.51.100.9', port: 1234 });
   ok('ping 应答', !!responded && Buffer.isBuffer(responded.id));
-  ok('节点进入路由表', spider.nodes.size >= 1);
+  ok('节点进入路由表', spider.routing && spider.routing.size() >= 1);
 
   // 畸形报文不崩溃
   spider._onMessage(Buffer.from('not bencode at all'), { address: '1.1.1.1', port: 1 });
