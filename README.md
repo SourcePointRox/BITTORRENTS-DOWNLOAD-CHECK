@@ -179,55 +179,63 @@ pm2 start scripts/cold-storage-worker.js --name bittorrents-cold
 
 ## 采集网络详解
 
-### DHT 爬虫（BEP-5 / BEP-51 / BEP-52）
+### DHT 多端口集群（BEP-5 / BEP-32 / BEP-51 / BEP-52）
 
-`src/collector/dht.js` — Mainline DHT 爬虫
+`src/collector/dht.js` — Mainline DHT 爬虫 + 多端口集群
 
-- **IPv4 + IPv6 双栈 UDP 监听**：`udp4` + `udp6` 同时 bind 6881，独立收发
-- **标准 Kademlia K-bucket 路由表**：160 桶 × K=8，LRU 淘汰，总容量上限 2000 节点
+- **DHTCluster 多端口并发**（v0.6.0 新增）：默认 3 个实例（`--dht-instances N` 可调），各自独立端口（base / base+1000 / base+2000）、独立节点 ID、独立路由表。单点端口被运营商/防火墙阻塞不再导致整体停摆，任一实例可用即维持采集
+- **UDP 端口预检**（v0.6.0 新增）：启动前用临时 socket 探测端口占用（`canBindUdp` / `findFreeUdpPort`），被占自动递增换端口（最多试 50 个），避免 `EADDRINUSE` 导致启动失败
+- **IPv4 + IPv6 双栈独立引导**（v0.6.0 修复，关键）：IPv6 DHT（BEP-32）是与 IPv4 DHT 平行的独立网络，旧版只对 udp4 做 bootstrap 且只用主机名（永远解析 A 记录），IPv6 DHT 从未引导 → v6 路由为空 → v6 peer 趋近 0。修复后 udp4 / udp6 各自独立引导：显式 `dns.lookup(all=true)`，A 记录走 udp4、AAAA 记录走 udp6，两条 DHT 各自建立路由覆盖。实测 v6 peer 采集量从 1 小时 4 个 → 75 秒 183 个
+- **want 字段**（v0.6.0 新增）：`find_node` / `get_peers` / `sample_infohashes` 查询携带 `want=[n4,n6]`（BEP-32），请求对方同时返回双栈节点；响应自适应解析 `nodes`(26B IPv4) / `nodes6`(38B IPv6)，按缓冲区对齐长度自动判定条目宽度
+- **标准 Kademlia K-bucket 路由表**：160 桶 × K=8，LRU 淘汰，总容量上限 2000 节点/实例；v6 节点单独统计（`nodes6`）
 - **XOR 距离前导零定位桶索引**：`bucketIndex()` 增量维护，避免全量排序
 - **节点 ID 周期性刷新**：每 15 分钟更换自身节点 ID，扩大路由覆盖
 - **v2 infohash 兼容**：64-hex v2 infohash 在 DHT 层面截断为前 20 字节（SHA-256 前 160 位）
-- **主动模式**：向路由表节点发 `get_peers`，从响应 `values` 提取 (ip, port, infohash)
+- **主动采集**：向路由表节点发 `get_peers`，从响应 `values` 提取 (ip, port, infohash)
   - 50% 概率用已知 infohash 查询（更可能获得 peer 列表）
   - 50% 概率用随机 infohash 查询（发现新种子）
   - IPv4(6B) + IPv6(18B) compact peer 解析
-- **被动模式**：应答他人的 `get_peers` / `announce_peer`，从 `announce_peer` 捕获真实做种
-- **BEP-51**：`sample_infohashes` 批量发现 infohash，发现后立即对其 `get_peers` 找 peer
-- **Bootstrap**：19 个全球 DHT 引导节点（去重），并行入网，失败自动串行重试
-- **端口冲突处理**：UDP 6881 被占用时自动递增端口（最多重试 20 个）
+- **被动采集（三通道）**：
+  - `announce_peer`：捕获真实做种者（a.port 为 BT 端口；implied_port=1 时记 null——那是 DHT/UDP 端口不是 BT 端口，避免误导 TCP 连接）
+  - `get_peers` 查询者（v0.6.0 新增）：正在全网寻找某 infohash 的节点即真实下载者，记录为 `dht_getpeers` 观测（iknowwhatyoudownload 式被动采集）
+  - `sample_infohashes`（BEP-51）：批量发现 infohash，发现后立即对其 `get_peers` 找 peer
+- **Bootstrap**：19 个全球 DHT 引导节点（去重），双栈并行入网，失败自动串行重试
 
 ### PEX 采集器（BEP-11）
 
 `src/collector/pex.js` — Peer Exchange
 
+- **MSE/PE 加密优先**（v0.6.0 修复）：qBittorrent / Transmission 等主流客户端默认 prefer-encrypt，明文握手被大量拒绝。现 MSE 加密握手优先，失败回退明文
+- **并发批量**（v0.6.0 修复）：并发 6 个 peer 同时连接（旧版串行 8×8s 每轮最坏 64s），最多 16 个种子 peer
+- **发送 interested**（v0.6.0 修复）：扩展握手后立即发送 `interested` 消息——多数客户端只对 interested 连接推送 PEX 列表
+- **2.5s 收集窗口**（v0.6.0 修复）：收到首条 PEX 后不立即断开，挂起 2.5s 持续收集增量推送
 - 在已有 BT TCP 连接上发送/接收 `ut_pex` 扩展消息
 - 从 PEX 消息中提取新增 peer（**IPv4 `added` + IPv6 `added6`**）
 - 支持 `added` / `added6` / `dropped` 紧凑格式解析
 - 每 45 秒对活跃种子做 PEX 扩散
-- IPv6 peer 现在有真实上游来源（DHT/Tracker 双栈产出 v6 peer）
 
-### Tracker 抓取器（BEP-3 / BEP-15 / BEP-7）
+### Tracker 抓取器（BEP-3 / BEP-15 / BEP-7 / BEP-52）
 
-`src/collector/tracker.js` — HTTP + UDP Tracker
+`src/collector/tracker.js` — HTTP + UDP Tracker + 万级动态 Tracker 池
 
-- **HTTP Tracker**（BEP-3）：紧凑 peer 格式解析，支持 `peers6` (BEP-7) IPv6 字段
-- **UDP Tracker**（BEP-15）：连接握手 → announce → peer 列表
+- **HTTP Tracker**（BEP-3）：紧凑 peer 格式解析，支持 `peers6` (BEP-7) IPv6 字段；**v2 支持 32 字节 infohash announce**（BEP-52）；附带 `ipv6=1` 提示（BEP-7）鼓励返回 peers6
+- **UDP Tracker**（BEP-15）：连接握手 → announce → peer 列表；v2 自动截断 20 字节（BEP-15 固定字段）
   - **DNS 解析并发竞速**：自动获取所有 A/AAAA 记录，IPv4/IPv6 同时尝试，首个成功立即返回
   - 支持 `udp4` + `udp6` socket
   - 兼容非标准混合/纯 IPv6 响应（`parseCompactPeersMixed` 按 6/18 字节对齐解析）
-- **静态 18 个公共 Tracker 种子**：按 hostname 去重，覆盖全球各地区（HTTP + UDP），仅作为远程拉取前/离线时的回退
-- **动态 TrackerManager**：
-  - 24 小时并行从多个公开源拉取实时更新列表（newTrackon 实时存活 API + `trackers_all.txt` + XIU2/DeSireFire/adysec + CDN 镜像），按主机去重后约 1000+ 个
-  - 5 分钟健康检查：对每个 tracker 发轻量 announce（numwant=1），记录延迟与存活（每批 40 并发）
-  - 连续 3 次失败标记为 dead，自动驱逐给新 tracker 让位
-  - 容量上限默认 1500，超出时优先驱逐 dead 条目；按 hostname 去重（优先 UDP）
-  - `getBest(limit)` 返回延迟最低的前 N 个存活 tracker；首轮检查未完成时回退全部，避免 harvest 空跑
+- **静态 18 个公共 Tracker 种子**：仅作为远程拉取前 / 离线时的回退
+- **万级动态 TrackerManager**（v0.6.0 全面重写）：
+  - **50+ 个每日自动更新列表源**：newTrackon 实时存活 API（all/stable/live/udp/http 5 个维度）；ngosang/trackerslist 全系列（all/ip/http/https/udp/best/best_ip）；XIU2/TrackersListCollection 全系列（all/best/http/nohttp/other）；DeSireFire/animeTrackerList **AT + ATline 双系列**（all/best/ip/udp/http/https）；adysec/tracker 全系列（all/best/best_http/best_https/best_udp，当前全网最大聚合源约 3465 条）；hezhijie0327/Trackerslist（tracker/combine/exclude）；CDN 镜像回退（jsDelivr 4 节点 / statically / cf.trackerslist.com / trackerslist.com）；HTML 页面源（torrenttrackerlist.com，正则提取 tracker URL）
+  - **URL 级去重**（替代旧 hostname 去重）：同一主机的不同端口/路径/协议是独立服务端点，全部保留，实测合并去重后约 **4000+ 唯一端点**（容量上限 10000，向五位数级别看齐）
+  - **全量健康检查（不截断）**：120 并发 × 5s 超时流式调度，每一个 tracker 每轮都被探测（不再只查前 20 个）；存活者优先复查（harvest 主力需新鲜延迟），dead 降频复查（每 3 轮 1 次保留复活机会）；连续 3 次失败标记 dead
+  - 检查间隔 10 分钟；远程列表刷新 12 小时
+  - `getBest(limit)` 返回延迟最低的前 60 个存活 tracker 供 harvest 使用；预热阶段回退全部避免空跑
+  - `getAllTrackers()` 返回全部 tracker 详情（监控 WebUI 全量展示，存活在前死亡在后）
 - 分批并发请求（每批 5 个），避免瞬时连接爆炸
 
 ### 元数据抓取（BEP-9 / BEP-10 / BEP-52）
 
-`src/collector/metadata.js` — BitTorrent 元数据
+`src/collector/metadata.js` — BitTorrent 元数据 + 多 BT 站聚合补全
 
 - TCP 连接 peer（**IPv4 和 IPv6**）→ **MSE/PE 加密握手** → BT 握手 → `ut_metadata` 扩展分片拉取
 - **握手 reserved bytes 置 BEP-52 v2 支持位**
@@ -235,8 +243,55 @@ pm2 start scripts/cold-storage-worker.js --name bittorrents-cold
 - **SHA-1 校验 v1 infohash** / **SHA-256 校验 v2 infohash**
 - v2 种子解析 `meta version=2` 的 file tree 递归结构，提取文件大小
 - **TF-IDF + Softmax 分类**（详见下方"种子分类器"），8 类自动分类
-- **并行 20 peer**（DHT peer 质量参差，并行提高成功率）
+- **并行 40 peer**（v0.6.0 提升，旧版 20），单 peer 超时 8s（v0.6.0 降低，旧版 12s），提高轮转与成功率
 - **重试机制**：每 10 秒对有 peer 但无 metadata 的种子重新解析，优先 announce_peer 真实做种者
+- **tracker 新鲜 peer 直通**（v0.6.0 新增）：tracker 收割到 ≥3 个 peer 的 hash 立即送入元数据队列（tracker 返回的是当前在线 peer，远好于 DHT 陈旧记录）
+
+### 多 BT 站元数据聚合补全（v0.6.0 新增）
+
+`src/collector/meta-search.js` — ut_metadata 失败时按 infohash 聚合查询开放种子库
+
+当 ut_metadata 从 peer 拉取失败（peer 下线 / 无元数据 / 连接被拒）时，按 infohash 聚合查询多个开放种子库 / BT 站，补全 name / size / category / seeders：
+
+| 优先级 | 数据源 | 类型 | 说明 |
+|---|---|---|---|
+| 1 | **SolidTorrents** | JSON API | DHT 爬虫索引，多域名镜像（eu/to/net）；免费 200 次/天，超限自动熔断切换 |
+| 2 | **Knaben Database** | JSON API | 聚合 TPB/Nyaa/1337x 等多家索引；`search_field=hash` + size 50 精确过滤 |
+| 3 | **apibay** (ThePirateBay) | JSON API | TPB 官方 API，多镜像（apibay.org/blue/sredu） |
+| 4 | **torrentz2.nz** | HTML 聚合 | 元搜索引擎，聚合多家索引，正则解析 `<dl>` 结果 |
+| 5 | **BT4G** | HTML | DHT 索引站，正则解析磁力卡片 |
+
+- **每 provider 独立熔断器**：连续失败 3 次冷却 10 分钟，自动恢复
+- **7 天 DB + 内存双层缓存**（含负缓存）：同一 infohash 7 天内不重复外查
+- **令牌桶限流**：全局并发闸 2 + 每源最小间隔 1.5s + 抖动 + 25 个/分钟上限
+- **只对活跃 hash 查询**：仅对 obs_log 中 ≥2 条观测的 hash 消耗外部索引配额（sample 噪声不查）
+- 补全结果 name/size/category 入库（`metadata_ok=0` 标记未经哈希校验）；knaben magnetUrl 中的 `ws=` 自动注册为 WebSeed
+
+### 全局爬虫聚合器（v0.6.0 新增）
+
+`src/collector/crawler.js` — DHT 全生态采集 + cross-infohash swarm merge
+
+- **find_node trawl**：100ms 周期对随机 target 查询随机节点，持续扩大路由覆盖（覆盖越广，sample/get_peers 命中的网络切片越广）
+- **BEP-51 高频采样**：500ms 周期 `sample_infohashes` 随机 target，发现的新 infohash 即时注册并送入 tracker 收割队列
+- **主动 announce**：60s 周期向最热 infohash 的 K 近邻节点宣告自身，吸引真实 leecher 反向连接（iknowwhatyoudownload 式被动采集 → 转化为 get_peers / announce_peer 观测）
+- **cross-infohash swarm merge**：同一内容常以多个 infohash 存在（重打包 / 混合 v1-v2 / 不同 tracker 分片）。内容签名 = `normalize(name) + '|' + size` 相同的种子视为 sibling swarm，其 peer 池自动互相合并（`swarm_merge` 来源），每轮最多处理 5 组、每组 200 条 peer
+- **全局稳定 peer**：在多个不同 swarm（≥3）出现的 IP 是长期在线节点，优先作为 ut_metadata / PEX 连接候选
+
+### WebSeed 采集器（v0.6.0 新增，BEP-19 GetRight）
+
+`src/collector/webseed.js` — HTTP/FTP 长效种子源探测 + 内容采样分类
+
+WebSeed 是种子内 `url-list`（或 magnet 的 `ws=` 参数）声明的 HTTP 内容源，本质上等价于 BitComet"长效种子"的 HTTP 缓存层：即使 BT swarm 死亡，内容仍可通过 HTTP 长存。
+
+- **WebSeed 注册**：从聚合搜索返回的 magnetUrl 解析 `ws=` / `xs=` 参数，注册到 infohash → Set(url) 注册表（每种子最多 8 个源）
+- **HEAD 活性探测**：探测 WebSeed URL 是否可用，成功 → 标记种子 `alive=1`
+- **HTTP Range 内容采样**：拉取文件头 512KB，用 **14 种魔数**（magic bytes）自动识别内容类型：
+  - 视频：MKV/WebM (EBML) / MP4 (ftyp) / AVI (RIFF) / WMV (ASF)
+  - 音频：MP3 (ID3/0xFFFB) / FLAC (fLaC) / OGG (OggS)
+  - 软件：RAR / PE/EXE (MZ) / ELF
+  - 文档：PDF (%PDF)
+- **自动修正分类**：对当前为 Unsorted 的种子，用魔数识别结果自动修正分类（如 MKV → Movies）
+- **工程化**：并发闸 2、每 host 最小间隔 5s、超时 8s，不产生外网请求风暴
 
 ### 协议加密 MSE/PE（BEP-8）
 
@@ -259,6 +314,7 @@ pm2 start scripts/cold-storage-worker.js --name bittorrents-cold
 `src/collector/dht.js` — uTP (Micro Transport Protocol) peer 识别
 
 - **implied_port 标志**：DHT `announce_peer` 消息中 `implied_port=1` 表示 peer 端口应取自 UDP 包源端口（而非 a.port 字段），这是 BEP-29 uTP 客户端的典型行为
+- **端口语义修正**（v0.6.0 关键修复）：旧版把 implied_port 的 rinfo.port（DHT/UDP 端口）误记为 BT TCP 端口，后续元数据/PEX 拿 UDP 端口做 TCP 连接必然超时。修正为 implied_port=1 时 port 记 `null`（不进入 TCP 候选池），仅保留 IP 作为观测
 - **被动检测**：在 `announce_peer` 处理路径中检测 `implied_port` 标志，统计 uTP peer 数量
 - **监控可见**：DHT stats 新增 `utpPeers` 字段，监控 WebUI IPv6 面板新增 uTP 计数显示
 
@@ -312,17 +368,24 @@ pm2 start scripts/cold-storage-worker.js --name bittorrents-cold
 - **WAL + busy_timeout 5s**：减少 SQLite 锁竞争
 - **日粒度去重**：同一 (ip, infohash, day) 仅计一次，减少写放大
 
-### GeoIP 地理位置解析
+### GeoIP 多源聚合解析（v0.6.0 增强）
 
-`src/server/geo.js` — 基于 ip-api.com 的真实批量查询
+`src/server/geo.js` — 多源聚合地理位置查询
 
-- **批量查询**：ip-api.com batch API（每批 100 IP，中文返回，含省/市/ISP/经纬度/时区）
+- **主源 ip-api.com 批量**：每批 100 IP，中文返回（含省/市/ISP/经纬度/时区）
+- **备用源轮换**（v0.6.0 新增）：主源限流 / 宕机时自动切换到备用源单查（并发 5）：
+  | 源 | 端点 | 说明 |
+  |---|---|---|
+  | freeipapi | `https://freeipapi.com/api/json/{ip}` | 免费 60/min |
+  | ipwho.is | `https://ipwho.is/{ip}?lang=zh-CN` | 免费 10k/月 |
+  | ipapi.co | `https://ipapi.co/{ip}/json/` | 免费 30k/月 |
+- **每源独立熔断器**：连续失败 3 次冷却 10 分钟，自动恢复；单源宕机不中断整体解析服务
 - **三层缓存**：内存缓存 → DB 缓存 → API 查询
 - **后台队列**：新 IP 同步返回占位值，异步加入待查队列，每 5 秒批量处理
 - **定期刷新**：每 2 小时刷新超 30 天的旧缓存
 - **补写机制**：每 30 秒补写之前因占位跳过的 country_daily 统计
 - **私有 IP 检测**：10.x / 172.16-31.x / 192.168.x / 127.x / IPv6 ULA 直接返回 Local
-- **降级策略**：API 不可用时返回占位值（`_pending: true`），不阻断服务
+- **监控可见**：监控面板展示各源健康状态（✓/✗ 计数与冷却倒计时）
 
 ```bash
 # 验证 ip-api.com 批量查询
@@ -338,29 +401,43 @@ node -e "async function t(){const ips=['8.8.8.8','114.114.114.114','218.26.74.1'
 
 ## 监控 WebUI
 
-独立运行在单独端口的监控面板，实时展示：
+独立运行在单独端口的监控面板，**API 分层 + 分步加载**（v0.6.0 重构，防卡死）：
 
 | 模块 | 内容 |
 |---|---|
 | 核心指标（8 列） | 采集模式 / 种子总数 / IP 节点 / 采集速率（含峰值均值）/ DHT 节点 / 元数据成功率 / 累计事件 / 健康度 |
-| 采集器状态 | DHT / Tracker / PEX 各采集器运行状态 + 发现 peer 数 + rx/tx 流量 |
-| 趋势图表 | 多来源堆叠面积图（DHT被动/主动/采样 + Tracker + PEX），15m/1h/3h/6h 时间窗口切换 |
+| 采集器状态 | DHT 集群 / Tracker / PEX / 爬虫聚合 各采集器运行状态 + 发现 peer 数 + rx/tx 流量 |
+| 趋势图表 | 多来源堆叠面积图（DHT被动/主动/采样/查询 + Tracker + PEX + Swarm合并 + 模拟），15m/1h/3h/6h/12h/24h 时间窗口切换 |
+| Top 国家 | 近 24h 地理分布 **扇形图**（doughnut + 图例 + 百分比） |
 | 来源分布 | 百分比 + 进度条 |
-| 元数据进度 | 种子总数 / 已解析名 / 已解析 size / 元数据 OK + size 落库率进度条 |
-| Top 国家 | 近 24h 地理分布 |
-| **IPv6 采集统计** | v6 peer 总数 / v4 peer 总数 / v6 (1h) / v6 (24h) + IPv6 占比进度条 + DHT 直接捕获 v6 数 |
+| 元数据进度 | 种子总数 / 已解析名 / 已解析 size / 聚合补全 / 元数据 OK + size 落库率进度条 |
+| **IPv6 采集统计** | v6 peer 总数 / v4 peer 总数 / v6 (1h) / v6 (24h) + IPv6 占比进度条 + DHT 直接捕获 v6 数 + **v6 路由节点数** + uTP 数 |
 | **Info Hash v2 (BEP-52)** | v1 / v2 / hybrid 种子数 + piece layers / file tree 落库数 + v2 落库率进度条 |
 | **冷存储状态** | 冷库总数 / 已同步 / 待同步 / 同步率 + 数据库路径 + 最近同步时间 |
-| **Tracker 健康度** | 总数 / 存活 / 死亡 / 平均延迟 + 存活率进度条 |
-| Tracker 详情表 | URL / 状态（存活/死亡/未检）/ 延迟 / 失败次数（按延迟升序，最多 20 条） |
-| 采集器综合统计 | 会话累计 / 本次新增 / DHT announce / DHT sample + 收发流量 + 模式/端口 |
+| **Tracker 健康度** | 总数 / 存活 / 死亡+未检 / 平均延迟 + 存活率进度条 + 健康检查状态 |
+| **Tracker 详情（全量）** | URL / 状态（存活/死亡/未检）/ 延迟 / 失败 / 最近检查时间，**全量滚动列表**（存活在前死亡在后）+ URL 过滤 + 滚动位置保持 |
+| 采集器综合统计 | 会话累计 / 本次新增 / DHT announce / DHT sample / 爬虫 trawl / swarm 合并 / WebSeed 源 / WS 修正分类 + DHT 集群端口 + GeoIP 源健康 + 聚合源健康 |
 | 实时事件流 | 最近 30 条观测（时间 / IP / 资源名 / **大小** / 来源徽章） |
-| DHT 路由表 | 节点 ID / 地址 / 年龄 |
+| DHT 路由表 | 节点 ID / 地址 / **族(v4/v6)** / 年龄 |
 | 系统资源 | 内存 RSS / 堆使用 / 运行时长 / Node 版本 + 内存占用趋势曲线 |
+
+### 分步加载（v0.6.0 新增，防卡死）
+
+大负荷查询与主流程脱离，API 拆分为独立端点，前端错峰首屏加载：
+
+| 端点 | 频率 | 内容 | 说明 |
+|---|---|---|---|
+| `GET /api/stats` | 2s | 轻量计数器 / 状态 / 健康度 / IPv6 / v2 / 冷存储 / 系统资源 | 不跑聚合 SQL，高频轮询 |
+| `GET /api/charts?mins=60` | 5s | 时间桶聚合（perMinute / perMinuteBySource）+ 来源分布 + Top国家 | 重量 SQL，低频轮询，走 `idx_obslog_ts` 索引 |
+| `GET /api/trackers` | 10s | 全量 tracker 详情列表（存活在前） + 池统计 | 大表，低频轮询 |
+| `GET /api/nodes` | 10s | DHT 路由表节点 | — |
+| `GET /api/health` | 按需 | 健康度 + 系统信息 | — |
+
+首屏加载顺序：`stats`(0ms) → `charts`(300ms) → `trackers`(800ms) → `nodes`(1500ms)，之后各自独立轮询。
 
 ### 平滑过渡
 
-图表使用 `chart.update()` 而非 `destroy() + new Chart()`，避免整图闪动重建，配合 400ms easeOutQuart 动画实现顺滑过渡。
+图表使用 `chart.update()` 而非 `destroy() + new Chart()`，避免整图闪动重建，配合 400ms easeOutQuart 动画实现顺滑过渡。Tracker 列表更新时保留滚动位置。
 
 ### 健康度评估
 
@@ -369,16 +446,6 @@ node -e "async function t(){const ips=['8.8.8.8','114.114.114.114','218.26.74.1'
 | 70-100 | 健康（绿色） | 采集正常，DHT 节点充足 |
 | 30-69 | 警告（黄色） | 节点不足或速率偏低 |
 | 0-29 | 异常（红色） | 采集器停止或无数据 |
-
-### JSON 接口
-
-| 端点 | 说明 |
-|---|---|
-| `GET /api/stats?mins=60` | 完整采集统计 + 系统指标 + 多来源分时数据 + Top国家 + IPv6 + v2 + 冷存储 + Tracker 列表 |
-| `GET /api/nodes` | DHT 路由表节点列表 |
-| `GET /api/health` | 健康度 + 系统信息 |
-| `GET /api/trend` | 近 6 小时采集趋势 |
-| `GET /api/system` | 系统资源指标 |
 
 ## 站点功能
 
@@ -427,14 +494,17 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 ```
 ├── src/
 │   ├── collector/
-│   │   ├── dht.js              # DHT 爬虫（BEP-5/51/52，IPv4+IPv6 双栈，Kademlia K-bucket 路由表，uTP 检测）
-│   │   ├── pex.js              # PEX 采集器（BEP-11 ut_pex，IPv4 added + IPv6 added6）
-│   │   ├── tracker.js          # Tracker 抓取器（HTTP BEP-3 + UDP BEP-15 + BEP-7 peers6 + TrackerManager）
-│   │   ├── metadata.js         # 元数据抓取（BEP-9/10/52，MSE/PE 加密，SHA-1/SHA-256 校验，file tree，并行 20 peer）
+│   │   ├── dht.js              # DHT 多端口集群（BEP-5/32/51/52，双栈独立引导，端口预检，Kademlia K-bucket，uTP 检测）
+│   │   ├── pex.js              # PEX 采集器（BEP-11，MSE优先+并发+interested+收集窗口）
+│   │   ├── tracker.js          # Tracker 抓取器（HTTP/UDP + 万级动态池 + 50+源 + URL级去重 + 全量健康检查）
+│   │   ├── metadata.js         # 元数据抓取（BEP-9/10/52，MSE/PE加密，SHA校验，file tree，并行40 peer）
+│   │   ├── meta-search.js      # 多BT站元数据聚合补全（SolidTorrents/Knaben/apibay/torrentz2/BT4G，熔断轮换）
+│   │   ├── crawler.js          # 全局爬虫聚合器（find_node trawl + BEP-51采样 + 主动announce + cross-infohash swarm merge）
+│   │   ├── webseed.js          # WebSeed 采集器（BEP-19，HTTP长效源探测 + Range采样 + 魔数修正分类）
 │   │   ├── mse.js              # 协议加密 MSE/PE（BEP-8，纯 JS RC4 + 768-bit DH 密钥交换）
 │   │   ├── classifier.js       # TF-IDF + Softmax 分类器（混合策略：正则硬规则 + ML）
 │   │   ├── pipeline.js         # 统一采集管道（TTL Map + 写队列批处理 + obs_log TTL）
-│   │   ├── service.js          # 采集服务调度（sim/live 模式 + TrackerManager + 冷存储集成 + uTP 统计）
+│   │   ├── service.js          # 采集服务调度（sim/live + DHT集群 + 爬虫 + WebSeed + 元数据聚合 + 冷存储 + GeoIP）
 │   │   ├── cold-storage.js     # 冷存储模块（独立 SQLite，name/size/magnet/v1/v2）
 │   │   ├── simulator.js       # 沙箱模拟数据源
 │   │   └── run.js             # 独立采集入口（--dht --tracker --pex）
@@ -445,37 +515,40 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 │   └── server/
 │       ├── index.js           # HTTP 服务主入口
 │       ├── api.js             # REST API 层
-│       ├── pages.js           # SSR 页面渲染（含 Global 视图 + 冷存储信息页）
+│       ├── pages.js           # SSR 页面渲染（含 Global 视图 + 冷存储信息页 + 美化布局）
 │       ├── admin.js           # 内嵌管理面板
-│       ├── monitor.js         # 独立监控 WebUI（IPv6/v2/冷存储/Tracker 面板 + 平滑过渡）
-│       ├── db.js              # 存储层（node:sqlite，WAL，迁移兼容，obs_log TTL）
-│       └── geo.js             # GeoIP 模块（ip-api.com 批量查询，三层缓存，降级策略）
+│       ├── monitor.js         # 独立监控 WebUI（API分层+分步加载+扇形图+全量tracker+多面板）
+│       ├── db.js              # 存储层（node:sqlite，WAL，迁移兼容，obs_log TTL + ts复合索引）
+│       └── geo.js             # GeoIP 多源聚合（ip-api主源 + freeipapi/ipwho.is/ipapi.co备用熔断轮换）
 ├── scripts/
-│   ├── start.js               # 一键启动（端口检测 → 站点 + 监控 + 采集 + 冷存储）
+│   ├── start.js               # 一键启动（端口检测 → 站点 + 监控 + 采集集群 + 冷存储）
 │   ├── cold-storage-worker.js # 独立冷存储 worker 入口
 │   └── seed.js                # 演示数据生成
-├── public/assets/             # 静态资源（Bootstrap/jQuery/Chart.js/FontAwesome 本地化）
-├── tests/                     # e2e / unit / stress / admin 测试
+├── public/assets/             # 静态资源（Bootstrap 5 / Chart.js 4 / FontAwesome 本地化）
+├── tests/                     # e2e / unit / stress / admin 测试（140 项）
 ├── docs/ARCHITECTURE.md       # 架构设计文档
 └── package.json
 ```
 
 ## 采集性能参考
 
-在公网环境下（UDP 6881 出站），典型采集表现：
+在公网环境下（3 DHT 实例集群，UDP 出站正常），v0.6.0 实测典型表现：
 
 | 指标 | 1 分钟 | 5 分钟 | 10 分钟 |
 |---|---|---|---|
-| DHT 路由表节点 | 500-1000 | 1500-2000 | 2000 (满) |
-| 发现 infohash | 100-500 | 1000-5000 | 5000-20000 |
-| 采集速率 | 50-100/min | 100-200/min | 150-300/min |
-| Tracker peers | 10-50 | 50-200 | 100-500 |
-| IPv6 peer 占比 | 1-5% | 5-15% | 10-20% |
-| Tracker 存活率 | 50-70% | 60-80% | 70-85% |
-| GeoIP 解析 | 实时批量 | — | — |
+| DHT 路由表节点（3 实例合计） | 200-350 | 350-450 | 450+ |
+| 其中 IPv6 路由节点 | 60-160 | 140-220 | 200+ |
+| 发现 infohash（sample_infohashes） | 1000-3000 | 3000-7000 | 7000+ |
+| 采集速率 | 200-500/min | 400-500/min | 500/min 稳定 |
+| Tracker peers（10 存活 tracker） | 100-300 | 300-800 | 800-1500 |
+| **IPv6 peer** | **100-200** | **500-1500** | **2000+** |
+| Tracker 池总量 | 3900+ | 3900+ | 3900+ |
+| Tracker 存活 | 8-15 | 8-15 | 8-15 |
+| 元数据 ut_metadata 成功率 | 取决于 NAT 环境 | — | — |
+| 元数据聚合补全（meta-search） | 25/min 令牌桶限流 | — | — |
 | 冷存储同步 | — | 增量追平主库 | — |
 
-> 性能取决于网络环境、DHT 节点质量、tracker 可用性、IPv6 双栈支持等因素。
+> 性能取决于网络环境、DHT 节点质量、tracker 可用性、IPv6 双栈支持等因素。上表为百兆 NAT 网络实测（部分 UDP tracker 不通、运营商 P2P 特征阻断 BT TCP 握手，元数据直连成功率受限；数据中心 / 公网 IP 环境下元数据成功率显著更高）。
 
 ## 技术要点
 
@@ -485,10 +558,12 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 - **写队列批处理**：500ms / 50 条事件批量写入，减少锁竞争
 - **TTL 化去重**：Map<key, ts> + 25h 过期清理，防止长跑内存无限增长
 - **obs_log TTL**：30 天保留 + wal_checkpoint(TRUNCATE) 回收空间
+- **obs_log 复合索引**（v0.6.0）：`idx_obslog_ts` + `idx_obslog_ts_source`，监控图表聚合查询走索引范围扫描
 - **日粒度去重**：同一 (ip, infohash, day) 仅计一次，减少写放大
-- **端口自动检测**：IPv4/IPv6 双栈检测，被占用时自动切换
+- **端口自动检测**：IPv4/IPv6 双栈检测 + DHT UDP 端口预检，被占用时自动切换
 - **健康度评估**：综合 DHT 节点数、采集速率、元数据成功率评分
-- **GeoIP 三层缓存**：内存 → DB → ip-api.com 批量查询，降级不阻断
+- **GeoIP 多源聚合**：ip-api 主源 + 3 备用源熔断轮换，三层缓存（内存 → DB → API），单源宕机不中断
+- **监控 API 分层**：轻量 stats(2s) / 重量 charts(5s) / 全量 trackers(10s) 独立端点 + 前端分步加载
 - **Kademlia 标准**：160 桶 × K=8 LRU，XOR 距离增量定位
 - **IPv6 全链路**：DHT 双栈 + PEX added6 + Tracker peers6 + TCP v6 元数据连接
 - **BEP-52 完整支持**：SHA-256 / 64-hex / multihash btmh / file tree / piece layers / hybrid 种子
@@ -504,15 +579,17 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 ## 技术栈
 
 - Node.js ≥ 22.5（标准库 + `node:sqlite`）
-- BitTorrent 协议：BEP-3 / BEP-5 / BEP-7 / BEP-8 / BEP-9 / BEP-10 / BEP-11 / BEP-15 / BEP-23 / BEP-29 / BEP-51 / BEP-52
-- Kademlia DHT：160 桶 × K=8 LRU 路由表
-- IPv6：双栈 UDP + compact6 peers + TCP v6 + DNS AAAA 并发竞速
+- BitTorrent 协议：BEP-3 / BEP-5 / BEP-7 / BEP-8 / BEP-9 / BEP-10 / BEP-11 / BEP-15 / BEP-19 / BEP-23 / BEP-29 / BEP-32 / BEP-51 / BEP-52
+- Kademlia DHT：160 桶 × K=8 LRU 路由表 + 多端口集群（DHTCluster）
+- IPv6：双栈独立引导（A/AAAA 分流）+ want=[n4,n6] + compact6 peers + TCP v6 + DNS AAAA 并发竞速
 - 协议加密：MSE/PE (BEP-8) + 纯 JS RC4 + 768-bit DH
+- WebSeed (BEP-19)：HTTP 长效源探测 + Range 采样 + 魔数分类
 - uTP (BEP-29)：基于 DHT implied_port 被动检测
 - ML 分类：TF-IDF + Softmax 多项逻辑回归（纯 JS 实现）
-- GeoIP：ip-api.com batch API（中文返回，三层缓存）
+- GeoIP：ip-api.com 主源 + freeipapi/ipwho.is/ipapi.co 备用熔断轮换（三层缓存）
+- 元数据聚合：SolidTorrents / Knaben / apibay / torrentz2 / BT4G 多源熔断轮换
 - 前端：Bootstrap 5 + Chart.js 4（全部本地化，无 jQuery）
-- 存储：SQLite (WAL 模式) + 独立冷存储 SQLite
+- 存储：SQLite (WAL 模式) + 独立冷存储 SQLite + obs_log ts 复合索引
 
 ---
 
