@@ -276,21 +276,45 @@ async function scrapeTracker(trackerUrl, infohashHex, opts = {}) {
 }
 
 /* ---------- 动态 tracker 管理 + 健康检查 ---------- */
-/* 远程公开 tracker 列表源（ngosang/trackerslist） */
+/* 远程公开 tracker 列表源：全网聚合 + 实时存活检测。
+   目标是尽可能覆盖“全网实时更新的开放 tracker”，因此同时使用：
+   1) newTrackon —— 一个持续对全网开放 tracker 做存活探测的实时服务（api/all 返回当前有响应的全部 tracker）；
+   2) 多个每日机器人自动更新的社区聚合列表（ngosang / XIU2 / DeSireFire / adysec）；
+   3) 上述列表的 CDN / 镜像地址（jsDelivr、cf.trackerslist.com），供 GitHub 访问受限的网络回退。
+   所有来源在拉取后按 hostname 去重合并，失败来源自动跳过。 */
 const DEFAULT_SOURCES = [
+  // 实时存活服务：newTrackon 持续探测全网开放 tracker
+  'https://newtrackon.com/api/all',
+  // 社区每日自动更新的聚合列表（GitHub 原始地址）
   'https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt',
-  'https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt',
+  'https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_ip.txt',
+  'https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/all.txt',
+  'https://raw.githubusercontent.com/DeSireFire/animeTrackerList/master/AT_all.txt',
+  'https://raw.githubusercontent.com/adysec/tracker/main/trackers_best.txt',
+  // CDN / 镜像回退（GitHub 直连受限时仍可获取到最新列表）
+  'https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt',
+  'https://cdn.jsdelivr.net/gh/XIU2/TrackersListCollection@master/all.txt',
+  'https://cf.trackerslist.com/all.txt',
 ];
 
 /* 健康检查用的探针 infohash（Ubuntu 镜像常见 hash，仅用于探测 tracker 是否响应） */
 const PROBE_INFOHASH = '9c0463c2d21c4be33ec99cb907e7e58f9e6d16a7';
 
+/* 单个 infohash 做 peer harvest 时最多使用的 tracker 数量（按延迟取最快的若干个）。
+   健康检查维护的存活池可以很大（数百个），但对每个 infohash 全量请求会造成网络风暴，
+   因此 harvest 只取最快的 N 个，兼顾发现广度与请求量。 */
+const HARVEST_TRACKER_LIMIT = 60;
+
 class TrackerManager {
   constructor(opts = {}) {
     this.trackers = new Map(); // url -> { url, alive, lastCheck, latency, fails }
+    this.hosts = new Map();    // hostname -> url（主机级去重，同一主机只保留一个入口，优先 UDP）
     this.checkInterval = opts.checkInterval || 300000; // 5 分钟检查一次
-    this.maxTrackers = opts.maxTrackers || 30;
+    /* 存活池容量上限：默认 1500，尽可能多地保留全网实时 tracker（当前各源去重后约 1000+ 个）。
+       健康检查分批并发（每批 40），harvest 只取最快的若干个，因此大池不会造成请求风暴。 */
+    this.maxTrackers = opts.maxTrackers || 1500;
     this.sources = (opts.sources && opts.sources.length) ? opts.sources : DEFAULT_SOURCES.slice();
+    this.lastFetch = { at: 0, sources: [] }; // 最近一次远程拉取的每源统计
     this._checkTimer = null;
     this._fetchTimer = null;
     this.started = false;
@@ -298,19 +322,38 @@ class TrackerManager {
     for (const url of PUBLIC_TRACKERS) this._add(url);
   }
 
-  /* 添加 tracker；超出容量时优先驱逐已判定为 dead 的条目 */
+  /* 添加 tracker：
+     - 先按 hostname 去重（同一主机的 http/https/udp 视为同一 tracker，优先保留 UDP）；
+     - 超出容量时优先驱逐已判定为 dead 的条目。 */
   _add(url) {
     if (!url || typeof url !== 'string') return false;
+    url = url.trim();
+    if (!/^(udp|https?):\/\//i.test(url)) return false;
     if (this.trackers.has(url)) return false;
+    const host = _hostOf(url);
+    const existing = this.hosts.get(host);
+    if (existing) {
+      // 同主机已存在：若新条目为 UDP 而旧条目不是，则用 UDP 替换（UDP 更快更稳）
+      const newIsUdp = url.startsWith('udp://');
+      const oldIsUdp = existing.startsWith('udp://');
+      if (newIsUdp && !oldIsUdp) {
+        this.trackers.delete(existing);
+        this.trackers.set(url, { url, alive: null, lastCheck: 0, latency: 0, fails: 0 });
+        this.hosts.set(host, url);
+        return true;
+      }
+      return false;
+    }
     if (this.trackers.size >= this.maxTrackers) {
       let evictKey = null;
       for (const [k, v] of this.trackers) {
         if (v.alive === false) { evictKey = k; break; }
       }
-      if (evictKey) this.trackers.delete(evictKey);
+      if (evictKey) { this.trackers.delete(evictKey); this.hosts.delete(_hostOf(evictKey)); }
       else return false;
     }
     this.trackers.set(url, { url, alive: null, lastCheck: 0, latency: 0, fails: 0 });
+    this.hosts.set(host, url);
     return true;
   }
 
@@ -333,27 +376,46 @@ class TrackerManager {
     if (this._fetchTimer) { clearInterval(this._fetchTimer); this._fetchTimer = null; }
   }
 
-  /* 从远程列表拉取并合并新 tracker（10s 超时） */
+  /* 拉取单个远程源的原始文本（不做合并，便于按优先级统一合并）。 */
+  async _fetchOne(src) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      const res = await fetch(src, { signal: ctrl.signal, headers: { 'User-Agent': 'ikwyd-tracker-fetch/1.0' } });
+      clearTimeout(timer);
+      if (!res.ok) return { source: src, ok: false, text: '', error: 'HTTP ' + res.status };
+      return { source: src, ok: true, text: await res.text(), error: null };
+    } catch (e) {
+      return { source: src, ok: false, text: '', error: String(e && e.message || e) };
+    }
+  }
+
+  /* 并行拉取所有远程列表（单源 15s 超时，失败源自动跳过），
+     再按 sources 声明顺序（实时存活源优先）合并，避免先到达的大列表占满容量。
+     记录每源的解析/新增数量供监控展示。 */
   async fetchLists() {
-    for (const src of this.sources) {
-      let text;
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 10000);
-        const res = await fetch(src, { signal: ctrl.signal });
-        clearTimeout(timer);
-        if (!res.ok) continue;
-        text = await res.text();
-      } catch (_) { continue; }
-      if (!text) continue;
-      for (const line of text.split(/\r?\n/)) {
+    const fetched = await Promise.allSettled(this.sources.map(src => this._fetchOne(src)));
+    const summary = [];
+    for (let i = 0; i < this.sources.length; i++) {
+      const src = this.sources[i];
+      const r = fetched[i];
+      if (r.status !== 'fulfilled' || !r.value.ok || !r.value.text) {
+        const err = r.status === 'fulfilled' ? r.value.error : String(r.reason && r.reason.message || r.reason);
+        summary.push({ source: src, ok: false, parsed: 0, added: 0, error: err || 'empty' });
+        continue;
+      }
+      let parsed = 0, added = 0;
+      for (const line of r.value.text.split(/\r?\n/)) {
         const u = line.trim();
-        if (!u || !/^(udp|https?):\/\//.test(u)) continue;
-        this._add(u);
+        if (!u || !/^(udp|https?):\/\//i.test(u)) continue;
+        parsed++;
+        if (this._add(u)) added++;
         if (this.trackers.size >= this.maxTrackers) break;
       }
-      if (this.trackers.size >= this.maxTrackers) break;
+      summary.push({ source: src, ok: true, parsed, added, error: null });
     }
+    this.lastFetch = { at: Date.now(), sources: summary };
+    return summary;
   }
 
   /* 健康检查：对每个 tracker 发轻量 announce（numwant=1），记录延迟与存活。
@@ -381,7 +443,7 @@ class TrackerManager {
           if (info.fails >= 3) info.alive = false;
         }
       })());
-      if (batch.length >= 10) await flush();
+      if (batch.length >= 40) await flush();
     }
     await flush();
   }
@@ -400,6 +462,23 @@ class TrackerManager {
     return alive; // 已检查但全部 dead → 返回空
   }
 
+  /* 返回延迟最低的前 limit 个存活 tracker（用于每个 infohash 的 harvest）。
+     预热阶段（尚无任何已检查项）回退为前 limit 个已知 tracker，避免 harvest 空跑。 */
+  getBest(limit = HARVEST_TRACKER_LIMIT) {
+    const alive = [];
+    let anyChecked = false;
+    for (const info of this.trackers.values()) {
+      if (info.alive === true) alive.push(info);
+      if (info.alive !== null) anyChecked = true;
+    }
+    if (alive.length) {
+      alive.sort((a, b) => (a.latency || 1e9) - (b.latency || 1e9));
+      return alive.slice(0, limit).map(t => t.url);
+    }
+    if (!anyChecked) return Array.from(this.trackers.keys()).slice(0, limit); // 预热阶段
+    return [];
+  }
+
   getStats() {
     let alive = 0, dead = 0, total = 0, latSum = 0, latN = 0;
     for (const info of this.trackers.values()) {
@@ -411,7 +490,9 @@ class TrackerManager {
         dead++;
       }
     }
-    return { total, alive, dead, avgLatency: latN ? Math.round(latSum / latN) : 0 };
+    return { total, alive, dead, avgLatency: latN ? Math.round(latSum / latN) : 0,
+      sources: this.sources.length, maxTrackers: this.maxTrackers,
+      lastFetchAt: this.lastFetch.at, fetchSources: this.lastFetch.sources };
   }
 
   /* 返回按延迟升序的 tracker 详情列表（用于监控 WebUI 展示） */
@@ -440,11 +521,12 @@ let _manager = null;
 function setManager(m) { _manager = m; }
 
 /* 对一个 infohash 遍历多个 tracker，聚合 peer 事件。
-   优先使用 TrackerManager.getAlive()；未启动时回退到静态 PUBLIC_TRACKERS。
+   优先使用 TrackerManager.getBest()（延迟最低的前 N 个存活 tracker）；未启动时回退到静态 PUBLIC_TRACKERS。
    返回 { peers, ipv6Peers }，并通过 valueOf 保持对旧版数值算术的兼容。 */
-async function harvest(infohashHex, onObservation) {
+async function harvest(infohashHex, onObservation, opts = {}) {
   const mgr = _manager || trackerManager;
-  const list = mgr.started ? mgr.getAlive() : PUBLIC_TRACKERS;
+  const limit = opts.limit || HARVEST_TRACKER_LIMIT;
+  const list = mgr.started ? mgr.getBest(limit) : PUBLIC_TRACKERS;
   const seenV4 = new Set();
   const seenV6 = new Set();
   const batchSize = 5;

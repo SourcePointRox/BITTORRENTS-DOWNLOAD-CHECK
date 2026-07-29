@@ -13,7 +13,7 @@ BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 
 - **uTP 检测 (BEP-29)**：通过 DHT `announce_peer` 的 `implied_port` 标志识别 uTP peer，统计监控面板可见
 - **TF-IDF + Softmax 分类器**：替代纯正则规则，多项逻辑回归 + 混合策略（正则硬规则优先 + ML 处理其余），8 类自动分类
 - **标准 Kademlia 路由**：160 桶 × K=8 LRU 路由表（替代平面 Map），节点 ID 周期性刷新扩大覆盖
-- **动态 Tracker 管理**：自动从 ngosang/trackerslist 拉取远程列表（24h），5 分钟健康检查 + 3 次失败剔除
+- **动态 Tracker 管理**：全网聚合多个实时更新源（newTrackon 实时存活 API + ngosang/XIU2/DeSireFire/adysec 等每日列表 + CDN 镜像回退），按主机去重后约 1000+ 个，5 分钟健康检查 + 3 次失败剔除
 - **独立冷存储进程**：分离进程转存种子元数据到独立 SQLite（仅 name/size/magnet/v1/v2），主进程状态可查
 - **真实 GeoIP**：基于 ip-api.com 批量查询（中文返回），内存+DB 双层缓存，30 天自动刷新，批量补写 country_daily
 - **元数据解析**：BT 握手（置 BEP-52 v2 位）→ ut_metadata 拉取 info 字典 → SHA-1/SHA-256 校验 → 自动分类，并行 20 peer + 重试
@@ -208,13 +208,13 @@ pm2 start scripts/cold-storage-worker.js --name bittorrents-cold
   - **DNS 解析并发竞速**：自动获取所有 A/AAAA 记录，IPv4/IPv6 同时尝试，首个成功立即返回
   - 支持 `udp4` + `udp6` socket
   - 兼容非标准混合/纯 IPv6 响应（`parseCompactPeersMixed` 按 6/18 字节对齐解析）
-- **静态 18 个公共 Tracker**：按 hostname 去重，覆盖全球各地区（HTTP + UDP）
+- **静态 18 个公共 Tracker 种子**：按 hostname 去重，覆盖全球各地区（HTTP + UDP），仅作为远程拉取前/离线时的回退
 - **动态 TrackerManager**：
-  - 24 小时从 ngosang/trackerslist 拉取远程列表（`trackers_all.txt` + `trackers_best.txt`）
-  - 5 分钟健康检查：对每个 tracker 发轻量 announce（numwant=1），记录延迟与存活
+  - 24 小时并行从多个公开源拉取实时更新列表（newTrackon 实时存活 API + `trackers_all.txt` + XIU2/DeSireFire/adysec + CDN 镜像），按主机去重后约 1000+ 个
+  - 5 分钟健康检查：对每个 tracker 发轻量 announce（numwant=1），记录延迟与存活（每批 40 并发）
   - 连续 3 次失败标记为 dead，自动驱逐给新 tracker 让位
-  - 容量上限 30 个，超出时优先驱逐 dead 条目
-  - `getAlive()` 返回存活列表；首轮检查未完成时回退为全部，避免 harvest 空跑
+  - 容量上限默认 1500，超出时优先驱逐 dead 条目；按 hostname 去重（优先 UDP）
+  - `getBest(limit)` 返回延迟最低的前 N 个存活 tracker；首轮检查未完成时回退全部，避免 harvest 空跑
 - 分批并发请求（每批 5 个），避免瞬时连接爆炸
 
 ### 元数据抓取（BEP-9 / BEP-10 / BEP-52）
@@ -510,6 +510,23 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.5.2 — 2026-07-29
+
+#### 优化
+
+- **Tracker 全网实时发现能力升级**：原 `TrackerManager` 仅从 2 个 GitHub 源拉取、`maxTrackers=30` 硬上限，且串行拉取命中上限即中断，实际仅发现约 202 个 tracker，远非全网实时数据。本次全面重写 `src/collector/tracker.js`：
+  - **接入全网实时源**：新增 **newTrackon `api/all`**（持续对全网开放 tracker 做存活探测的实时服务）作为最高优先级来源；叠加 ngosang（`trackers_all` + `trackers_all_ip`）、XIU2、DeSireFire、adysec 等每日自动更新列表；并加入 **jsDelivr / cf.trackerslist.com CDN 镜像**作为 GitHub 直连受限时的回退
+  - **并行拉取 + 优先级合并**：所有源并行抓取（单源 15s 超时，失败源自动跳过），再按 `sources` 声明顺序（实时存活源优先）合并，避免先返回的大列表把容量占满而挤掉实时源
+  - **按主机名去重**：同一 hostname 的 http/https/udp 视为同一 tracker，优先保留 UDP 入口
+  - **容量上限 30 → 1500**，健康检查并发 25 → 40（每批），保证数百上千个 tracker 能在 5 分钟检查周期内跑完
+  - **新增 `getBest(limit)`**：每个 infohash 的 peer harvest 只取延迟最低的前 60 个存活 tracker，存活池可以很大却不会因每个 infohash 全量请求造成网络风暴
+  - **`getStats()` 扩展**：额外返回 `sources` / `maxTrackers` / `lastFetchAt` / `fetchSources` 等字段供监控展示
+
+#### 验证
+
+- 实测 9 个源全部可达并正确解析，去重后共 **1039 个唯一 tracker**（UDP 429 / HTTP 610），newTrackon 实时列表被优先合并
+- `node --check` 语法通过；现有单元测试 **30/30 全部通过**
+
 ### v0.5.1 — 2026-07-29
 
 #### 修复
@@ -643,12 +660,16 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
   - 节点 ID 每 15 分钟刷新，扩大路由覆盖
   - 总容量上限 2000 节点
 
-- **动态 Tracker 管理 (TrackerManager)**：
-  - 24 小时从 ngosang/trackerslist 拉取远程公开列表
-  - 5 分钟健康检查：对每个 tracker 发轻量 announce (numwant=1)，记录延迟
-  - 连续 3 次失败标记为 dead，自动驱逐给新 tracker 让位
-  - 容量上限 30 个，超出时优先驱逐 dead 条目
-  - `getAlive()` 智能回退：首轮检查未完成时返回全部，避免 harvest 空跑
+- **动态 TrackerManager**：
+  - 24 小时并行从多个公开源拉取实时更新列表（按声明优先级合并，实时存活源优先）：
+    - **newTrackon** `api/all`：持续对全网开放 tracker 做存活探测的实时服务
+    - **ngosang/trackerslist**（`trackers_all.txt` + `trackers_all_ip.txt`）
+    - **XIU2/TrackersListCollection**、**DeSireFire/animeTrackerList**、**adysec/tracker**
+    - jsDelivr / cf.trackerslist.com **CDN 镜像回退**（GitHub 直连受限的网络仍可获取）
+  - 5 分钟健康检查：对每个 tracker 发轻量 announce (numwant=1)，记录延迟（每批 40 并发）
+  - 按 hostname 去重（同一主机 http/https/udp 视为同一 tracker，优先保留 UDP）
+  - 连续 3 次失败标记为 dead，容量上限默认 1500，超出时优先驱逐 dead 条目
+  - `getBest(limit)`：按延迟取最快的前 N 个存活 tracker 供 harvest 使用，预热未完成时回退避免空跑
   - `getTopTrackers(limit)` 按延迟升序返回详情列表
   - 监控 WebUI：新增 Tracker 健康度面板 + 详情列表表
 
