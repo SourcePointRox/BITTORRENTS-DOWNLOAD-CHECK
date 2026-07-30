@@ -595,6 +595,41 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.8.2 — 2026-07-30
+
+> 监控 WebUI P0 级缺陷修复：空白页崩溃 + 模块不刷新 + 布局溢出。
+
+#### P0 修复（严重）
+
+- **监控 WebUI 空白页崩溃（P0）**：
+  - **根因**：当采集器未启动时（`collectorRef === null`），`/api/stats`、`/api/charts`、`/api/nodes`、`/api/trackers` 均返回 HTTP 503 + `{error:'...'}`。前端 `refreshStats()` 的 `.then(r=>r.json())` 仍解析 503 响应体（JSON 格式），将 `{error:'...'}` 传入 `applyStats()`，`stats.value = {error:'...'}` 替换整个响应式状态。随后模板执行 `{{ stats.mode.toUpperCase() }}` → `undefined.toUpperCase()` → **Vue 渲染崩溃 → 整个页面空白**
+  - **修复**：
+    1. 所有 `refresh*()` 函数添加 `r.ok` 守卫：`fetch(url).then(r=>r.ok?r.json():null)` — HTTP 非 2xx 时跳过 JSON 解析，传 `null`
+    2. `applyStats(s)` 添加 `if (!s || typeof s.mode === 'undefined') return;` — 阻止无效数据覆盖响应式状态
+    3. `applyCharts(c)` 添加 `if (!c || !Array.isArray(c.perMinuteBySource)) return;`
+    4. `refreshTrackers` / `refreshNodes` 添加 `Array.isArray` 验证
+    5. 添加 Vue `app.config.errorHandler` 全局错误处理，即使渲染异常也不会白屏
+  - **验证**：collector 为 null 时，三个 API 均返回 503，前端保持初始状态正常渲染（`mode: 'off'`），不崩溃
+
+#### 修复
+
+- **系统资源模块宽度溢出**：
+  - **根因**：CSS Grid `1fr` 等同于 `minmax(auto, 1fr)`，内容最小宽度会撑大列宽，导致系统资源卡片比同行的实时事件流和 DHT 路由表更宽
+  - **修复**：所有 grid 列定义从 `1fr` → `minmax(0, 1fr)`、`2fr 1fr` → `minmax(0,2fr) minmax(0,1fr)`，强制等分列宽；`.card` 添加 `overflow:hidden`
+- **内存占用趋势图不显示**：
+  - **根因**：`ensureMemChart()` 在首次 `applyStats` 的 `nextTick` 中初始化，如果 canvas 尚未渲染则返回 null，后续无重试
+  - **修复**：`onMounted` 中添加 `setTimeout(() => { ensureRateChart(); ensureCcChart(); ensureMemChart(); }, 50)` 提前初始化所有图表
+- **实时事件流 / DHT 路由表 / 采集器统计 / 冷存储 / 元数据进度不刷新**：
+  - **根因**：与 P0 相同 — API 返回 503 时错误对象覆盖 `stats.value`，`stats.recent` 变为 `undefined`，模板 `v-for="(e,i) in stats.recent"` 不渲染；`nodes.value` 同理
+  - **修复**：P0 修复后，`stats.value` 保持有效状态，轮询正常工作（2s stats / 5s charts / 10s trackers+nodes）
+
+#### 验证
+
+- 140 项测试全部通过（30 unit + 59 e2e + 18 stress + 33 admin）
+- P0 场景验证：collector=null 时三个 API 返回 503，前端页面正常渲染不空白
+
+---
+
 ### v0.8.1 — 2026-07-30
 
 > 监控 WebUI 交互修复 + Tracker 健康检查全面加强。
