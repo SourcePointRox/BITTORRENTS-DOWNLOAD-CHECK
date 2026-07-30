@@ -595,6 +595,64 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.7.0 — 2026-07-30
+
+> 大版本：Tracker 网络重构 + Kademlia K-bucket + 元数据校验修复 + GeoIP 本地库 + UPnP/SOCKS5 + CIDR SQL 化 + 手动添加 Tracker。
+
+#### 修复
+
+- **Tracker 健康检查误判死亡（严重）**：
+  - **根因**：快速模式 300 并发导致系统 socket/文件描述符耗尽，正常 tracker 超时被误判死亡；DNS 无缓存导致每次检查都重新解析域名；HTTP 无 keepalive 每次都新建 TCP 连接增加延迟
+  - **修复**：并发从 300 降至 80（快速）/ 60（常规），避免 fd 耗尽；添加 DNS 缓存（5 分钟 TTL）；HTTP 启用 keepalive 连接池（50 sockets per agent）；超时从 3s 增至 6s（快速）/ 8s（常规），给国际 tracker 足够响应时间
+- **元数据校验效率为 0（严重）**：
+  - **根因**：`_fetchPlaintext` 和 `fetchFromPeerMSE` 用 `reqIndex` 计数器判定完成，遇到重复/乱序响应时提前达标，`got` 缓冲区残留零字节 → SHA-1/SHA-256 of 残缺 info dict 必然不匹配 infohash → 校验永远失败 → 元数据永远无法入库
+  - **修复**：移除 `reqIndex` 计数器，改用 `receivedPieces = new Set()` 跟踪已收到的不重复分片；完成判定改为 `receivedPieces.size >= Math.ceil(metaSize / BLOCK)`；初始请求改为流水线一次性请求全部分片
+- **分类规则顺序敏感**：`[SubsPlease] Show S02E05` 命中 Anime 发布组优先于 TV → 重排规则：强结构信号（SxxExx/年份+分辨率）优先于发布组信号
+
+#### 新增
+
+- **手动添加 Tracker 功能**：
+  - `TrackerManager.addTrackers(input)` 方法：支持换行/逗号/空格分隔的批量输入，自动去重，添加后立即触发增量健康检查
+  - `TrackerManager.removeTracker(url)` 方法：手动删除 tracker
+  - 监控 WebUI 新增"+ 添加 Tracker"按钮 + 弹窗表单（textarea 多行输入），添加后自动刷新列表
+  - API 端点：`POST /api/trackers/add`（body: `{trackers: "url1\nurl2"}`）、`POST /api/trackers/remove`（body: `{url: "..."}`）
+- **标准 Kademlia K-bucket 路由表（BEP-5）**：
+  - 替代平面 Map，实现二叉前缀树（trie）：160 桶 × K=8，满桶分裂（仅自身 ID 所在桶），LRU 淘汰
+  - K 近邻选择沿 target 方向优先遍历近子树，无需全局线性扫描
+  - `refreshTargets` 返回陈旧桶对应的随机 target ID，定期 find_node 刷新路由覆盖
+  - 不再轮换自身 node ID（破坏路由稳定性，已移除）
+- **GeoIP 本地离线库**：
+  - 纯 JS MMDB 二进制读取器（`src/server/mmdb-reader.js`），支持 MaxMind GeoLite2 格式（24/28/32 位 record size，IPv4/IPv6 查询）
+  - 解析流程：本地 MMDB 优先 → 本地未命中才 fallback 到在线 API（95%+ IP 本地解析）
+  - 下载脚本 `scripts/download-geoip.js`（纯标准库 tar 解包，支持 `--country-only`）
+  - 本地库未加载时静默降级到在线 API
+- **UPnP / NAT-PMP 端口映射**（`src/common/upnp.js`）：
+  - SSDP 发现网关 → UPnP IGD AddPortMapping/DeletePortMapping → NAT-PMP UDP 映射
+  - 自动映射 DHT UDP 端口，失败静默降级
+  - `--upnp` / `--no-upnp` CLI 选项（默认开启）
+- **SOCKS5 代理支持**（`src/common/proxy.js`）：
+  - RFC 1928 CONNECT 方法（IPv4/IPv6/域名）+ RFC 1929 用户名/密码认证
+  - `wrapDgramSocket` 包装 dgram socket 通过 SOCKS5 发送 UDP
+  - 环境变量 `IKWYD_SOCKS5_PROXY`（格式：`host:port` 或 `user:pass@host:port`）
+- **CIDR 查询单 SQL 化**：
+  - `peers` 表新增 `ip_int INTEGER` 列 + 部分索引 `idx_peers_ipint`
+  - CIDR 查询从应用层循环改为 `WHERE ip_int BETWEEN start AND end`（单 SQL）
+  - 幂等迁移：现有 IPv4 行自动回填 `ip_int`
+  - pipeline 写入时自动计算 `ipToInt(ip)`
+- **node:sqlite 驱动抽象层**（`src/common/db-driver.js`）：
+  - 封装实验性 API，提供稳定接口；自动降级到 better-sqlite3（如果安装）；未来 API 变动只需修改此文件
+
+#### 优化
+
+- **DNS 缓存**：5 分钟 TTL，避免健康检查时反复解析同一域名
+- **HTTP keepalive**：复用 TCP 连接池（50 sockets per agent），减少握手开销
+- **健康检查参数调优**：快速 80 并发 × 6s，常规 60 并发 × 8s（避免 fd 耗尽导致误判死亡）
+
+#### 验证
+
+- 140 项测试全部通过（30 unit + 59 e2e + 18 stress + 33 admin）
+- 功能验证：分类修复后 `[SubsPlease] Show S02E05` → TV（原误判 Anime）
+
 ### v0.6.1 — 2026-07-30
 
 #### 优化

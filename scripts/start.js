@@ -31,6 +31,8 @@ function parseArgs() {
     if (tok === '--live') { args.live = true; continue; }
     if (tok === '--no-collector') { args.noCollector = true; continue; }
     if (tok === '--no-monitor') { args.noMonitor = true; continue; }
+    if (tok === '--upnp') { args.upnp = true; continue; }
+    if (tok === '--no-upnp') { args.upnp = false; continue; }
     if (tok === '--seed') { args.seed = true; continue; }
     // 带 value 的参数
     const next = raw[i + 1];
@@ -62,6 +64,8 @@ BITTORRENTS-DOWNLOAD-CHECK 一键启动
   --monitor-port <n>    指定监控端口（默认 8090，被占用则自动切换）
   --dht-port <n>        指定 DHT UDP 起始端口（默认 6881，仅 live 模式；占用自动换端口）
   --dht-instances <n>   DHT 集群并发实例数（默认 3，多端口容错，仅 live 模式）
+  --upnp                启用 UPnP/NAT-PMP 端口映射（默认开启，--no-upnp 关闭）
+  --no-upnp             关闭 UPnP/NAT-PMP 端口映射
   --seed                强制重新生成演示数据
   --help, -h            显示本帮助
 
@@ -198,6 +202,7 @@ async function main() {
     collector: collectorMode,
     dhtPort: Number(args.dhtPort) || 6881,
     dhtInstances: Number(args.dhtInstances) || 3,
+    upnp: args.upnp !== false,
   });
 
   // 6. 启动独立监控 WebUI
@@ -226,6 +231,8 @@ async function main() {
   console.log(`[start] 采集模式:      ${collectorMode || 'off'}${collectorMode === 'live' ? ' (DHT+PEX+Tracker)' : ''}`);
   if (collectorMode === 'live') {
     console.log(`[start] DHT UDP:       ${Number(args.dhtPort) || 6881} (IPv4+IPv6 双栈)`);
+    console.log(`[start] UPnP/NAT-PMP:  ${args.upnp !== false ? '开启' : '关闭'}`);
+    if (process.env.IKWYD_SOCKS5_PROXY) console.log(`[start] SOCKS5 代理:   ${process.env.IKWYD_SOCKS5_PROXY.replace(/:[^:@]*@/, ':****@')}`);
   }
   console.log('[start] ═══════════════════════════════════════════');
   console.log('[start] 按 Ctrl+C 优雅退出');

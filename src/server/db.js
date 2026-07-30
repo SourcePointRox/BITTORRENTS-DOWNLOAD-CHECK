@@ -31,9 +31,11 @@ CREATE INDEX IF NOT EXISTS idx_torrents_v2 ON torrents(infohash_v2) WHERE infoha
 CREATE TABLE IF NOT EXISTS peers (
   ip         TEXT PRIMARY KEY,
   first_seen INTEGER,
-  last_seen  INTEGER
+  last_seen  INTEGER,
+  ip_int     INTEGER                  -- IPv4 的数值形式（4 字节大端整数，如 1.2.3.4 → 16909060）；IPv6 为 NULL
 );
 CREATE INDEX IF NOT EXISTS idx_peers_lastseen ON peers(last_seen);
+CREATE INDEX IF NOT EXISTS idx_peers_ipint ON peers(ip_int) WHERE ip_int IS NOT NULL; -- 加速 CIDR BETWEEN 查询
 
 CREATE TABLE IF NOT EXISTS observations (
   ip         TEXT NOT NULL,
@@ -126,7 +128,8 @@ CREATE TABLE IF NOT EXISTS torrents (
 CREATE TABLE IF NOT EXISTS peers (
   ip         TEXT PRIMARY KEY,
   first_seen INTEGER,
-  last_seen  INTEGER
+  last_seen  INTEGER,
+  ip_int     INTEGER                  -- IPv4 的数值形式（IPv6 为 NULL）；旧库 ALTER 补列
 );
 CREATE TABLE IF NOT EXISTS observations (
   ip         TEXT NOT NULL,
@@ -191,6 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_torrents_firstseen ON torrents(first_seen);
 CREATE INDEX IF NOT EXISTS idx_torrents_hashver ON torrents(hash_version);
 CREATE INDEX IF NOT EXISTS idx_torrents_v2 ON torrents(infohash_v2) WHERE infohash_v2 IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_peers_lastseen ON peers(last_seen);
+CREATE INDEX IF NOT EXISTS idx_peers_ipint ON peers(ip_int) WHERE ip_int IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_obs_hash ON observations(infohash);
 CREATE INDEX IF NOT EXISTS idx_obslog_hash_ts ON obs_log(infohash, ts);
 CREATE INDEX IF NOT EXISTS idx_obslog_ts ON obs_log(ts);
@@ -218,6 +222,24 @@ function open(file) {
   for (const [col, type] of [['hash_version','INTEGER'],['infohash_v2','TEXT'],['piece_layers_json','TEXT'],['file_tree_json','TEXT'],['cold_synced','INTEGER']]) {
     try { db.exec(`ALTER TABLE torrents ADD COLUMN ${col} ${type}${col === 'hash_version' ? ' DEFAULT 1' : col === 'cold_synced' ? ' DEFAULT 0' : ''}`); } catch (_) {}
   }
+  // 兼容旧库：为 peers 补 ip_int 列并回填现有 IPv4 行（IPv6 保留 NULL）
+  //   - ALTER 已存在则忽略
+  //   - 回填幂等：仅处理 ip_int IS NULL 且为 IPv4 的行，新写入由 pipeline 写入 ip_int
+  try { db.exec('ALTER TABLE peers ADD COLUMN ip_int INTEGER'); } catch (_) {}
+  try {
+    const rows = db.prepare("SELECT ip FROM peers WHERE ip_int IS NULL AND ip NOT LIKE '%:%'").all();
+    if (rows.length) {
+      const { ipToInt } = require('../common/util');
+      const upd = db.prepare('UPDATE peers SET ip_int = ? WHERE ip = ?');
+      db.exec('BEGIN');
+      try {
+        for (const r of rows) upd.run(ipToInt(r.ip), r.ip);
+        db.exec('COMMIT');
+      } catch (e) {
+        try { db.exec('ROLLBACK'); } catch (_) {}
+      }
+    }
+  } catch (_) { /* 回填失败不阻断启动 */ }
   // 列补全后再创建依赖这些列的索引
   db.exec(SCHEMA_INDEXES);
   return db;

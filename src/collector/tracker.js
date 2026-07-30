@@ -11,7 +11,26 @@ const dns = require('dns');
 const bencode = require('../common/bencode');
 const { formatIPv6, isIPv6 } = require('../common/util');
 
-const { lookup: dnsLookup } = dns.promises;
+const { lookup: dnsLookupRaw } = dns.promises;
+
+/* ---------- DNS 缓存（5 分钟 TTL，避免健康检查时反复解析同一域名） ---------- */
+const DNS_CACHE = new Map(); // host -> { addrs, expires }
+const DNS_TTL = 300000; // 5 分钟
+
+async function dnsLookup(host, opts) {
+  const now = Date.now();
+  const cached = DNS_CACHE.get(host);
+  if (cached && cached.expires > now) return cached.addrs;
+  const addrs = await dnsLookupRaw(host, opts);
+  DNS_CACHE.set(host, { addrs, expires: now + DNS_TTL });
+  return addrs;
+}
+
+/* ---------- HTTP keepalive 连接池（复用 TCP 连接，减少握手开销） ---------- */
+const http = require('http');
+const https = require('https');
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 10000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: 10000 });
 
 /* 全球公共 tracker 种子列表（HTTP + UDP，覆盖各地区）。
    已按 URL 去重：同一主机不同端口/路径/协议视为不同 tracker 端点（它们都是独立的服务实例）。 */
@@ -112,7 +131,11 @@ async function scrapeHTTP(trackerUrl, infohashHex, opts = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeout || 8000);
   try {
-    const res = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'uTorrent/3.5.5' } });
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { 'User-Agent': 'uTorrent/3.5.5', 'Accept': 'application/octet-stream, text/plain, */*' },
+      agent: url.startsWith('https:') ? httpsAgent : httpAgent,
+    });
     const body = Buffer.from(await res.arrayBuffer());
     let decoded;
     try { decoded = bencode.decode(body); } catch (_) { decoded = null; }
@@ -384,13 +407,14 @@ const PROBE_INFOHASH = '9c0463c2d21c4be33ec99cb907e7e58f9e6d16a7';
 const HARVEST_TRACKER_LIMIT = 60;
 
 /* 健康检查参数：两档策略。
-   - 快速首轮（fast）：300 并发 × 3s 超时 → 4000 tracker 约 40s 完成首轮；
-   - 常规维护：120 并发 × 5s 超时 → 全量复查约 3 分钟 < 10 分钟间隔。
-   存活者优先复查，连续 3 次失败标记 dead，dead 每 3 轮降频复查 1 次。 */
-const HEALTH_CONCURRENCY = 120;
-const HEALTH_TIMEOUT = 5000;
-const FAST_CONCURRENCY = 300;
-const FAST_TIMEOUT = 3000;
+   - 快速首轮（fast）：80 并发 × 6s 超时 → 平衡速度与系统资源（避免 fd 耗尽导致误判死亡）
+   - 常规维护：60 并发 × 8s 超时 → 全量复查，给国际 tracker 足够响应时间
+   存活者优先复查，连续 3 次失败标记 dead，dead 每 3 轮降频复查 1 次。
+   注意：并发过高（300）会导致系统 socket/fd 耗尽，反而让正常 tracker 超时被误判死亡。 */
+const HEALTH_CONCURRENCY = 60;
+const HEALTH_TIMEOUT = 8000;
+const FAST_CONCURRENCY = 80;
+const FAST_TIMEOUT = 6000;
 
 class TrackerManager {
   constructor(opts = {}) {
@@ -677,6 +701,33 @@ class TrackerManager {
 
   /* getAllTrackers：getTopTrackers(null) 的语义化别名，监控 API 使用 */
   getAllTrackers() { return this.getTopTrackers(null); }
+
+  /* 手动添加 tracker（支持批量，自动去重，立即触发健康检查）。
+     输入：字符串（换行/逗号/空格分隔）或字符串数组。
+     返回：{ added, duplicates, errors } */
+  addTrackers(input) {
+    const urls = typeof input === 'string'
+      ? input.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean)
+      : Array.isArray(input) ? input.map(s => s.trim()).filter(Boolean) : [];
+    const result = { added: 0, duplicates: 0, errors: [] };
+    const newUrls = [];
+    for (const u of urls) {
+      if (!/^(udp|https?):\/\//i.test(u)) { result.errors.push(u); continue; }
+      if (this._add(u)) { result.added++; newUrls.push(u); }
+      else result.duplicates++;
+    }
+    // 立即对新添加的 tracker 触发增量健康检查
+    if (newUrls.length && this.started) {
+      this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
+    }
+    return result;
+  }
+
+  /* 手动删除 tracker */
+  removeTracker(url) {
+    const key = String(url).trim().toLowerCase();
+    return this.trackers.delete(key);
+  }
 }
 
 /* 模块级默认管理器实例；调用 trackerManager.start() 后 harvest 优先使用其存活列表 */

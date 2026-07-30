@@ -9,6 +9,9 @@ data/*.sqlite
 data/*.sqlite-shm
 data/*.sqlite-wal
 
+# GeoIP offline MMDB databases (large binary, download via scripts/download-geoip.js)
+data/geoip/*.mmdb
+
 # Runtime logs
 *.log
 logs/

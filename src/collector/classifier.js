@@ -330,13 +330,21 @@ class TorrentClassifier {
   }
 }
 
-/* ---------- 正则规则回退（与原 CATEGORY_RULES 一致） ---------- */
+/* ---------- 正则规则回退（上下文感知优先级） ----------
+   顺序敏感：强结构信号优先于发布组信号。
+   - SxxExx/season/episode 是电视剧的强结构特征，优先于动漫发布组，
+     解决 [SubsPlease] 等带 SxxExx 的发布被误判为 Anime 的问题。
+   - 年份+分辨率是电影的强结构特征，同样优先于动漫发布组。
+   - 动漫发布组（subsplease/erai-raws 等）仅在不具备 TV/Movie 强信号时命中，
+     纯动漫命名（无 SxxExx、无年份）仍正确归入 Anime。 */
 const REGEX_RULES = [
   [/\b(XXX|xxx|adult|18\+|porn|hentai)\b/i, 'XXX'],
-  // Anime 优先于 TV：覆盖主流动漫发布组与术语，避免 "Final Season" 等被误判为 TV
-  [/\b(anime|ova|amv|subsplease|erai-raws|horriblesubs|crunchyroll|commie|doremi|anime-koi|mutiny|pgs|asw|suki|subsplus+)\b/i, 'Anime'],
+  // 上下文感知：SxxExx / season / episode → TV，优先于动漫发布组
   [/\b(s\d{1,2}e\d{1,2}|season|episode|s\d{2}\b|complete\.series)\b/i, 'TV'],
+  // 上下文感知：年份 + 分辨率 → Movie，优先于动漫发布组
   [/\b(19\d{2}|20\d{2})\b.*\b(1080p|720p|2160p|4k|bluray|brrip|web-?dl|webrip|hdrip|dvdrip|cam|hd-?ts)\b/i, 'Movies'],
+  // 动漫发布组/术语：仅在不具备 TV/Movie 强信号时命中
+  [/\b(anime|ova|amv|subsplease|erai-raws|horriblesubs|crunchyroll|commie|doremi|anime-koi|mutiny|pgs|asw|suki|subsplus+)\b/i, 'Anime'],
   [/\b(mp3|flac|aac|320kbps|discography|album|soundtrack|ost)\b/i, 'Music'],
   [/\b(repack|fitgirl|rune|codex|empress|pc\.iso|game|gog)\b/i, 'Games'],
   [/\b(epub|mobi|pdf|ebook|audiobook)\b/i, 'Books'],

@@ -46,6 +46,16 @@ function json(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
+/* 读取 POST 请求体 */
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', (c) => { data += c; if (data.length > 100000) req.destroy(); });
+    req.on('end', () => resolve(data));
+    req.on('error', () => resolve(''));
+  });
+}
+
 /* 系统指标 */
 function systemMetrics() {
   const mem = process.memoryUsage();
@@ -288,6 +298,24 @@ async function handle(req, res) {
     try { list = collectorRef.getTrackerList(); } catch (_) { list = []; }
     const t = collectorRef.trackerMgr ? collectorRef.trackerMgr.getStats() : null;
     return json(res, 200, { total: list.length, stats: t, list });
+  }
+  // 手动添加 tracker（POST /api/trackers/add，body: { trackers: "url1\nurl2,..." }）
+  if (pathname === '/api/trackers/add' && req.method === 'POST') {
+    if (!collectorRef || !collectorRef.trackerMgr) return json(res, 503, { error: 'tracker manager not running' });
+    const body = await readBody(req);
+    let input = '';
+    try { input = JSON.parse(body).trackers || ''; } catch (_) { input = body; }
+    const result = collectorRef.trackerMgr.addTrackers(input);
+    return json(res, 200, result);
+  }
+  // 手动删除 tracker（POST /api/trackers/remove，body: { url: "..." }）
+  if (pathname === '/api/trackers/remove' && req.method === 'POST') {
+    if (!collectorRef || !collectorRef.trackerMgr) return json(res, 503, { error: 'tracker manager not running' });
+    const body = await readBody(req);
+    let url = '';
+    try { url = JSON.parse(body).url || ''; } catch (_) { url = body; }
+    const ok = collectorRef.trackerMgr.removeTracker(url);
+    return json(res, 200, { removed: ok });
   }
   if (pathname === '/api/nodes') {
     if (!collectorRef) return json(res, 503, { error: 'collector not initialized' });
@@ -576,6 +604,7 @@ function dashboardHtml() {
         <span>Tracker 详情（全量 · 存活在前 · 滚动查看）</span>
         <span>
           <input type="text" class="trk-filter" id="trkFilter" placeholder="过滤 URL…">
+          <button id="trkAddBtn" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:12px;margin-left:4px">+ 添加 Tracker</button>
           <span id="trkListCount" style="color:#54626f;margin-left:8px"></span>
         </span>
       </div>
@@ -1008,6 +1037,48 @@ document.addEventListener('click', function(e) {
 document.getElementById('trkFilter').addEventListener('input', function(e) {
   trkFilterText = e.target.value || '';
   renderTrackers();
+});
+
+/* 手动添加 Tracker 弹窗 */
+document.getElementById('trkAddBtn').addEventListener('click', function() {
+  var existing = document.getElementById('trkAddModal');
+  if (existing) { existing.remove(); return; }
+  var modal = document.createElement('div');
+  modal.id = 'trkAddModal';
+  modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML = '<div style="background:#1c2331;border:1px solid #30363d;border-radius:8px;padding:20px;width:560px;max-width:90vw">' +
+    '<div style="color:#c9d1d9;font-size:15px;font-weight:600;margin-bottom:10px">手动添加 Tracker</div>' +
+    '<div style="color:#7d8a99;font-size:11px;margin-bottom:8px">输入一个或多个 tracker URL（每行一个，或用逗号/空格分隔）。支持 udp:// 和 http(s):// 协议。重复的自动忽略。</div>' +
+    '<textarea id="trkAddInput" style="width:100%;height:140px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:8px;font-family:monospace;font-size:12px;resize:vertical" placeholder="udp://tracker.example.com:6969/announce\\nhttp://tracker.example.com:8080/announce"></textarea>' +
+    '<div id="trkAddResult" style="margin-top:8px;font-size:12px"></div>' +
+    '<div style="margin-top:12px;text-align:right">' +
+      '<button id="trkAddCancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 16px;cursor:pointer;margin-right:8px">取消</button>' +
+      '<button id="trkAddConfirm" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:6px 16px;cursor:pointer">添加并检查</button>' +
+    '</div></div>';
+  document.body.appendChild(modal);
+  document.getElementById('trkAddInput').focus();
+  document.getElementById('trkAddCancel').addEventListener('click', function() { modal.remove(); });
+  modal.addEventListener('click', function(e) { if (e.target === modal) modal.remove(); });
+  document.getElementById('trkAddConfirm').addEventListener('click', function() {
+    var input = document.getElementById('trkAddInput').value.trim();
+    if (!input) return;
+    var resultEl = document.getElementById('trkAddResult');
+    resultEl.innerHTML = '<span style="color:#7d8a99">正在添加并触发健康检查…</span>';
+    fetch('/api/trackers/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trackers: input })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      var msg = '✓ 添加 ' + d.added + ' 个';
+      if (d.duplicates > 0) msg += '，重复 ' + d.duplicates + ' 个';
+      if (d.errors && d.errors.length > 0) msg += '，错误 ' + d.errors.length + ' 个（格式不正确）';
+      resultEl.innerHTML = '<span style="color:#3fb950">' + msg + '</span>' +
+        (d.errors && d.errors.length ? '<br><span style="color:#f85149;font-size:11px">无效: ' + d.errors.slice(0,3).join(', ') + (d.errors.length > 3 ? '…' : '') + '</span>' : '');
+      if (d.added > 0) setTimeout(function() { refreshTrackers(); modal.remove(); }, 2000);
+    }).catch(function(e) {
+      resultEl.innerHTML = '<span style="color:#f85149">添加失败: ' + e.message + '</span>';
+    });
+  });
 });
 
 /* 分步首屏加载：stats(0ms) → charts(300ms) → trackers(800ms) → nodes(1500ms)

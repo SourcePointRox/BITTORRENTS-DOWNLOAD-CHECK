@@ -2,7 +2,7 @@
 /* REST API 层：路由与官方 Peer/Torrent/Content API 对齐，响应字段增强（magnet / firstSeen）。 */
 const db = require('./db');
 const geo = require('./geo');
-const { magnetURI, isIPv4, ipToInt, intToIp, fmtDay } = require('../common/util');
+const { magnetURI, isIPv4, ipToInt, fmtDay } = require('../common/util');
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj, null, 2);
@@ -70,18 +70,18 @@ const handlers = {
     if (!m) return err(res, 400, 'INVALID_CIDR', 'value of cidr is invalid');
     const base = m[1], bits = parseInt(m[2], 10);
     if (!isIPv4(base) || bits < 18 || bits > 32) return err(res, 400, 'INVALID_CIDR', 'CIDR min /18');
+    // 单 SQL 化：把 CIDR 范围换算成 [start, end] 两个 ip_int，走 WHERE ip_int BETWEEN
+    //   - start = base & mask（mask = 连续 bits 个 1 的高位掩码）
+    //   - end   = start + 2^(32-bits) - 1
+    //   - 使用 >>> 0 保证 JS 位运算结果为无符号 32 位整数
+    const mask = (0xFFFFFFFF << (32 - bits)) >>> 0;
+    const start = (ipToInt(base) & mask) >>> 0;
+    const end = (start + (1 << (32 - bits)) - 1) >>> 0;
     const d = db.get();
-    const start = ipToInt(base) & (0xFFFFFFFF << (32 - bits));
-    const count = 1 << (32 - bits);
-    const peers = [];
-    // 受限展开（/18 最多 16384）
-    const limit = Math.min(count, 20000);
-    const stmt = d.prepare('SELECT ip,last_seen FROM peers WHERE ip=?');
-    for (let i = 0; i < limit; i++) {
-      const ip = intToIp((start + i) >>> 0);
-      const row = stmt.get(ip);
-      if (row) peers.push({ ip, date: new Date(row.last_seen).toISOString() });
-    }
+    // 上限 20000 与原受限展开保持一致；IPv6 行 ip_int 为 NULL 不会命中 BETWEEN
+    const rows = d.prepare('SELECT ip, last_seen FROM peers WHERE ip_int BETWEEN ? AND ? ORDER BY last_seen DESC LIMIT 20000')
+      .all(start, end);
+    const peers = rows.map(r => ({ ip: r.ip, date: new Date(r.last_seen).toISOString() }));
     json(res, 200, { CIDR: cidr, peers });
   },
 

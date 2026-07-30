@@ -13,6 +13,8 @@ const dgram = require('dgram');
 const dns = require('dns');
 const bencode = require('../common/bencode');
 const { randomBytes } = require('../common/util');
+const upnp = require('../common/upnp');
+const { parseSocksConfig, wrapDgramSocket } = require('../common/proxy');
 
 const { lookup: dnsLookup } = dns.promises;
 
@@ -69,19 +71,32 @@ function bucketIndex(nodeId, target) {
   return nodeId.length * 8 - 1;
 }
 
-/* ---------- 标准 Kademlia K-bucket ---------- */
+/* ---------- 标准 Kademlia K-bucket（BEP-5）----------
+   路由表采用二叉前缀树（trie）组织，替代旧的"固定 160 桶 + 线性扫描"结构：
+   - 每个叶子节点是一个 K-bucket，最多容纳 K=8 个节点
+   - 内部节点按 node ID 的某一 bit 划分左右子树（bit 0 = 最高有效位）
+   - 桶分裂：当叶子桶满且"包含自身 ID"时递归分裂（细化近邻区域）；
+     不包含自身 ID 的远端桶满时按 LRU 淘汰最久未联系节点
+   - 选 K 近邻：沿 target 方向优先遍历近子树，不足时回溯远子树，
+     近子树节点与 target 的 XOR 距离严格不大于远子树，无需全局排序
+   - 每个桶记录 lastChanged，供定期 bucket refresh 使用 */
 class KBucket {
   constructor() {
     this.nodes = []; // [{id, host, port, family, lastSeen}]
+    this.lastChanged = Date.now();
   }
   add(node) {
     const idx = this.nodes.findIndex(n => n.id.equals(node.id));
-    if (idx >= 0) { this.nodes.splice(idx, 1); this.nodes.push(node); return true; }
-    if (this.nodes.length < K) { this.nodes.push(node); return true; }
-    // 桶满：淘汰最久未联系（LRU）
-    this.nodes.shift();
+    if (idx >= 0) { this.nodes.splice(idx, 1); this.nodes.push(node); this.lastChanged = Date.now(); return true; }
+    if (this.nodes.length < K) { this.nodes.push(node); this.lastChanged = Date.now(); return true; }
+    return false; // 桶满（由 RoutingTable 决定分裂或 LRU）
+  }
+  /* 不可分裂的远端桶满时：淘汰队首（最久未联系），追加新节点 */
+  evictLRUAndAdd(node) {
+    const evicted = this.nodes.shift();
     this.nodes.push(node);
-    return true;
+    this.lastChanged = Date.now();
+    return evicted || null;
   }
   closest(target, k) {
     return this.nodes.slice().sort((a, b) => xorCmp(a.id, b.id, target)).slice(0, k);
@@ -92,40 +107,174 @@ class KBucket {
 class RoutingTable {
   constructor(nodeId) {
     this.nodeId = nodeId;
-    this.buckets = Array.from({ length: 160 }, () => new KBucket());
-    this.index = new Map(); // idHex -> bucketIdx（快速查找）
+    /* 二叉前缀树根：初始为单个叶子桶（覆盖整个 160-bit ID 空间）。
+       叶子节点：{ type:'leaf', bucket, depth }
+       内部节点：{ type:'internal', bit, left, right }（bit=划分位，0=MSB） */
+    this.root = { type: 'leaf', bucket: new KBucket(), depth: 0 };
+    this.index = new Map(); // idHex -> 叶子节点（快速查找/去重）
   }
+
+  /* 取 id 的第 bit 位（0=最高有效位） */
+  _bit(id, bit) {
+    return (id[bit >> 3] >> (7 - (bit & 7))) & 1;
+  }
+
+  /* 按 id 沿前缀树下行到所在叶子 */
+  _walkToLeaf(id) {
+    let cur = this.root;
+    while (cur.type === 'internal') {
+      cur = this._bit(id, cur.bit) === 0 ? cur.left : cur.right;
+    }
+    return cur;
+  }
+
+  _leafContainsSelf(leaf) {
+    return this._walkToLeaf(this.nodeId) === leaf;
+  }
+
+  /* 将满的叶子桶分裂为两个子桶（仅当包含自身 ID 时调用） */
+  _split(leaf) {
+    const bit = leaf.depth;
+    const left = { type: 'leaf', bucket: new KBucket(), depth: leaf.depth + 1 };
+    const right = { type: 'leaf', bucket: new KBucket(), depth: leaf.depth + 1 };
+    for (const n of leaf.bucket.nodes) {
+      const tgt = this._bit(n.id, bit) === 0 ? left : right;
+      tgt.bucket.nodes.push(n);
+      tgt.bucket.lastChanged = leaf.bucket.lastChanged;
+      this.index.set(n.id.toString('hex'), tgt);
+    }
+    leaf.type = 'internal';
+    leaf.bit = bit;
+    leaf.left = left;
+    leaf.right = right;
+    leaf.bucket = null;
+  }
+
   add(node) {
-    const bi = bucketIndex(this.nodeId, node.id);
-    const added = this.buckets[bi].add(node);
-    if (added) this.index.set(node.id.toString('hex'), bi);
-    return added;
+    const leaf = this._walkToLeaf(node.id);
+    if (leaf.bucket.add(node)) {
+      this.index.set(node.id.toString('hex'), leaf);
+      return true;
+    }
+    // 桶满：若该桶包含自身 ID 则递归分裂后重试（标准 Kademlia 行为）
+    if (leaf.depth < 160 && this._leafContainsSelf(leaf)) {
+      this._split(leaf);
+      return this.add(node);
+    }
+    // 不可分裂的远端桶：LRU 淘汰，保持爬虫路由表新鲜
+    const evicted = leaf.bucket.evictLRUAndAdd(node);
+    if (evicted) this.index.delete(evicted.id.toString('hex'));
+    this.index.set(node.id.toString('hex'), leaf);
+    return true;
   }
+
+  get(id) {
+    const leaf = this.index.get(id.toString('hex'));
+    if (!leaf) return null;
+    return leaf.bucket.nodes.find(n => n.id.equals(id)) || null;
+  }
+
+  /* 选 K 近邻：沿 target 方向优先下行近子树，不足时回溯远子树 */
   closest(target, k) {
-    const all = [];
-    for (const b of this.buckets) all.push(...b.nodes);
-    return all.sort((a, b) => xorCmp(a.id, b.id, target)).slice(0, k);
+    const result = [];
+    this._collectClosest(this.root, target, k, result);
+    result.sort((a, b) => xorCmp(a.id, b.id, target));
+    return result.slice(0, k);
   }
+  _collectClosest(node, target, k, result) {
+    if (node.type === 'leaf') {
+      for (const n of node.bucket.nodes) result.push(n);
+      return;
+    }
+    const side = this._bit(target, node.bit);
+    const near = side === 0 ? node.left : node.right;
+    const far = side === 0 ? node.right : node.left;
+    this._collectClosest(near, target, k, result);
+    if (result.length < k) this._collectClosest(far, target, k, result);
+  }
+
   size() {
-    let n = 0; for (const b of this.buckets) n += b.nodes.length; return n;
-  }
-  size6() {
     let n = 0;
-    for (const b of this.buckets) for (const node of b.nodes) if (node.family === 'ipv6') n++;
+    const walk = (node) => {
+      if (node.type === 'leaf') { n += node.bucket.nodes.length; return; }
+      walk(node.left); walk(node.right);
+    };
+    walk(this.root);
     return n;
   }
+
+  size6() {
+    let n = 0;
+    const walk = (node) => {
+      if (node.type === 'leaf') {
+        for (const nd of node.bucket.nodes) if (nd.family === 'ipv6') n++;
+        return;
+      }
+      walk(node.left); walk(node.right);
+    };
+    walk(this.root);
+    return n;
+  }
+
   values() {
     const out = [];
-    for (const b of this.buckets) out.push(...b.nodes);
+    const walk = (node) => {
+      if (node.type === 'leaf') { for (const n of node.bucket.nodes) out.push(n); return; }
+      walk(node.left); walk(node.right);
+    };
+    walk(this.root);
     return out;
   }
-  refreshNodeId() {
-    this.nodeId = randomBytes(20);
-    // 节点 ID 变了，桶分配会变，简单清空重建
-    const nodes = this.values();
-    this.buckets = Array.from({ length: 160 }, () => new KBucket());
-    this.index.clear();
-    for (const n of nodes) this.add(n);
+
+  /* ---------- bucket refresh（BEP-5）----------
+     返回需要刷新的桶对应的随机 target ID 列表（供上层发起 find_node）。
+     maxAge: 桶未变动超过该时长视为陈旧。 */
+  refreshTargets(maxAge, maxCount = 8) {
+    const now = Date.now();
+    const targets = [];
+    const walk = (node) => {
+      if (node.type === 'leaf') {
+        if (node.bucket.nodes.length > 0 && now - node.bucket.lastChanged > maxAge) {
+          targets.push(this._randomIdForLeaf(node));
+        }
+        return;
+      }
+      walk(node.left); walk(node.right);
+    };
+    walk(this.root);
+    return targets.slice(0, maxCount);
+  }
+
+  /* 生成落在指定叶子桶 ID 区间内的随机 ID（前缀固定，剩余位随机） */
+  _randomIdForLeaf(leaf) {
+    const id = randomBytes(20);
+    const path = this._pathToLeaf(leaf);
+    for (const { bit, side } of path) this._setBit(id, bit, side);
+    return id;
+  }
+
+  _pathToLeaf(leaf) {
+    const path = [];
+    const walk = (node) => {
+      if (node === leaf) return true;
+      if (node.type === 'leaf') return false;
+      path.push({ bit: node.bit, side: 0 });
+      if (walk(node.left)) return true;
+      path.pop();
+      path.push({ bit: node.bit, side: 1 });
+      if (walk(node.right)) return true;
+      path.pop();
+      return false;
+    };
+    walk(this.root);
+    return path;
+  }
+
+  _setBit(buf, bit, val) {
+    const byteIdx = bit >> 3;
+    const bitInByte = 7 - (bit & 7);
+    if (val) buf[byteIdx] |= (1 << bitInByte);
+    else buf[byteIdx] &= ~(1 << bitInByte);
   }
 }
 
@@ -173,24 +322,36 @@ class DHTSpider {
     this.sock6 = null;
     this.hasV6 = false;            // udp6 是否成功监听
     this.stats = { rx: 0, tx: 0, peers: 0, announces: 0, samples: 0, ipv6Peers: 0, utpPeers: 0, nodes6: 0 };
+    /* UPnP/NAT-PMP 端口映射（默认开启，opts.upnp === false 关闭）；
+       SOCKS5 代理（opts.proxy 或环境变量 IKWYD_SOCKS5_PROXY）。
+       代理模式下跳过本地端口预检/UPnP/udp6，所有 UDP 经代理中继。 */
+    this.upnpEnabled = opts.upnp !== false;
+    this.proxy = opts.proxy || (process.env.IKWYD_SOCKS5_PROXY ? parseSocksConfig(process.env.IKWYD_SOCKS5_PROXY) : null);
+    this.mappedPorts = [];        // 已映射端口（供 stop 时清理）
   }
 
   /* 启动：端口预检（占用自动换端口）→ 双栈 bind → 双栈独立引导。
-     等待 udp4 实际 listening 后才返回（bind 异步，确保集群能正确识别可用实例）。 */
+     等待 udp4 实际 listening 后才返回（bind 异步，确保集群能正确识别可用实例）。
+     SOCKS5 代理模式下：跳过本地端口预检与 udp6，UDP 全部经代理中继。
+     非代理模式下：bind 后自动尝试 UPnP/NAT-PMP 端口映射（失败静默降级）。 */
   async start() {
-    const free = await findFreeUdpPort(this.port, 50);
-    if (free == null) {
-      console.log(`[dht] ✘ ${this.port}~${this.port + 49} 全部被占用，本实例放弃启动`);
-      return this;
-    }
-    if (free !== this.port) {
-      console.log(`[dht] 端口 ${this.port} 被占用，切换到 ${free}`);
-      this.port = free;
+    if (!this.proxy) {
+      const free = await findFreeUdpPort(this.port, 50);
+      if (free == null) {
+        console.log(`[dht] ✘ ${this.port}~${this.port + 49} 全部被占用，本实例放弃启动`);
+        return this;
+      }
+      if (free !== this.port) {
+        console.log(`[dht] 端口 ${this.port} 被占用，切换到 ${free}`);
+        this.port = free;
+      }
     }
     this._bindSocket(this.port, 'udp4');
-    this._bindSocket(this.port, 'udp6');
+    if (!this.proxy) this._bindSocket(this.port, 'udp6');
     this.queryTimer = setInterval(() => this._activeQuery(), QUERY_INTERVAL);
-    this.refreshTimer = setInterval(() => this.routing.refreshNodeId(), 15 * 60 * 1000);
+    // bucket refresh（BEP-5）：定期对长期未变动的桶发起 find_node 刷新路由覆盖。
+    // 不再轮换自身 node ID（旧实现会破坏路由稳定性）。
+    this.refreshTimer = setInterval(() => this._refreshBuckets(), 15 * 60 * 1000);
     // 等待 udp4 listening（最多 3s）确认实例真实可用
     await new Promise((resolve) => {
       if (this.running) return resolve();
@@ -199,15 +360,36 @@ class DHTSpider {
       }, 50);
       const t = setTimeout(() => { clearInterval(iv); resolve(); }, 3000);
     });
+    // UPnP/NAT-PMP 端口映射（仅非代理模式；失败静默降级，不影响主流程）
+    if (this.upnpEnabled && !this.proxy && this.running) {
+      try {
+        const r = await upnp.mapPort(this.port, this.port, 'udp');
+        if (r) {
+          this.mappedPorts.push({ externalPort: this.port, protocol: 'udp' });
+          console.log(`[dht] UPnP/NAT-PMP 映射 ${this.port}/udp ✔ (${r.method})`);
+        }
+      } catch (_) { /* 静默降级 */ }
+    }
     return this;
   }
 
-  /* 创建 socket 并 bind；EADDRINUSE 时递增端口重试（作为预检之外的兜底） */
+  /* 创建 socket 并 bind；EADDRINUSE 时递增端口重试（作为预检之外的兜底）。
+     SOCKS5 代理模式下：udp4 用 wrapDgramSocket 经代理中继，udp6 跳过。 */
   _bindSocket(port, family) {
     let sock;
-    try { sock = dgram.createSocket(family); } catch (_) { return; }
+    if (this.proxy) {
+      // 代理模式仅支持 udp4（SOCKS5 UDP 中继为 IPv4）
+      if (family === 'udp6') return;
+      sock = wrapDgramSocket(this.proxy);
+    } else {
+      try { sock = dgram.createSocket(family); } catch (_) { return; }
+    }
     sock.on('message', (msg, rinfo) => this._onMessage(msg, rinfo));
     sock.on('error', (err) => {
+      if (this.proxy) {
+        console.log(`[dht] SOCKS5 代理连接失败: ${err.message}`);
+        return;
+      }
       if (err && err.code === 'EADDRINUSE' && family === 'udp4') {
         this.port++;
         console.log(`[dht] port ${this.port - 1} in use, trying ${this.port}`);
@@ -233,6 +415,11 @@ class DHTSpider {
   stop() {
     this.running = false;
     clearInterval(this.queryTimer); clearInterval(this.refreshTimer);
+    // 清理 UPnP/NAT-PMP 端口映射（异步，best-effort，不阻塞关闭）
+    for (const m of this.mappedPorts) {
+      try { upnp.unmapPort(m.externalPort, m.protocol); } catch (_) {}
+    }
+    this.mappedPorts = [];
     if (this.sock4) try { this.sock4.close(); } catch (_) {}
     if (this.sock6) try { this.sock6.close(); } catch (_) {}
   }
@@ -295,6 +482,21 @@ class DHTSpider {
         }
         if (this.routing.size() > 0) break;
       }
+    }
+  }
+
+  /* bucket refresh（BEP-5）：对长期未变动的桶发起 find_node，刷新路由覆盖。
+     自身 node ID 保持稳定（不再轮换），仅对陈旧桶补节点。 */
+  async _refreshBuckets() {
+    const targets = this.routing.refreshTargets(15 * 60 * 1000, 8);
+    for (const target of targets) {
+      const nodes = this.routing.values();
+      if (!nodes.length) break;
+      const node = nodes[Math.floor(Math.random() * nodes.length)];
+      try {
+        const r = await this._query('find_node', { target, want: ['n4', 'n6'] }, node.host, node.port, 'find_node');
+        if (r) this._addResponseNodes(r, node.family || 'ipv4');
+      } catch (_) {}
     }
   }
 
@@ -531,6 +733,8 @@ class DHTCluster {
         onObservation: this.opts.onObservation,
         onInfohash: this.opts.onInfohash,
         getKnownInfohashes: this.opts.getKnownInfohashes,
+        upnp: this.opts.upnp,
+        proxy: this.opts.proxy,
       });
       await spider.start();
       if (spider.running) this.instances.push(spider);

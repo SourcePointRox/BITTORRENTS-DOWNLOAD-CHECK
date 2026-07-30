@@ -84,6 +84,7 @@ class CollectorService {
     this.dhtInstances = opts.dhtInstances || 3;
     this.cluster = new DHTCluster({
       port: opts.dhtPort || 6881,
+      upnp: opts.upnp !== false,
       onObservation: (ev) => this._ingest(ev),
       onInfohash: (ih) => { if (pipeline.registerInfohash(ih)) this.counters.newTorrents++; },
       getKnownInfohashes: () => {

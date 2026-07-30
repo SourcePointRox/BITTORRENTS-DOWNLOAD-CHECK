@@ -9,7 +9,7 @@
    - obs_log 定期 TTL 清理（30 天保留） */
 const db = require('../server/db');
 const geo = require('../server/geo');
-const { fmtDay, normalizeInfohash } = require('../common/util');
+const { fmtDay, normalizeInfohash, isIPv4, ipToInt } = require('../common/util');
 
 const CATEGORIES = ['Movies', 'TV', 'Anime', 'Music', 'Games', 'Software', 'Books', 'XXX', 'Unsorted'];
 
@@ -33,8 +33,10 @@ function init() {
   const d = db.get();
   stmts = {
     insLog: d.prepare('INSERT INTO obs_log(ip,port,infohash,ts,source) VALUES(?,?,?,?,?)'),
-    upPeer: d.prepare(`INSERT INTO peers(ip,first_seen,last_seen) VALUES(?,?,?)
-                       ON CONFLICT(ip) DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen)`),
+    upPeer: d.prepare(`INSERT INTO peers(ip,first_seen,last_seen,ip_int) VALUES(?,?,?,?)
+                       ON CONFLICT(ip) DO UPDATE SET
+                         last_seen=MAX(last_seen, excluded.last_seen),
+                         ip_int=COALESCE(excluded.ip_int, peers.ip_int)`),
     upObs: d.prepare(`INSERT INTO observations(ip,infohash,first_seen,last_seen,hits) VALUES(?,?,?,?,1)
                       ON CONFLICT(ip,infohash) DO UPDATE SET
                         last_seen=MAX(last_seen, excluded.last_seen), hits=hits+1`),
@@ -147,7 +149,9 @@ function ingest(ev) {
     const pKey = ev.ip + '|' + day;
     if (!peersTouched.has(pKey)) {
       peersTouched.set(pKey, ts);
-      stmts.upPeer.run(ev.ip, ts, ts);
+      // IPv4 写入数值形式 ip_int 供 CIDR BETWEEN 查询；IPv6 写 NULL
+      const ipInt = isIPv4(ev.ip) ? ipToInt(ev.ip) : null;
+      stmts.upPeer.run(ev.ip, ts, ts, ipInt);
     }
     stmts.upObs.run(ev.ip, infohash, ts, ts);
 

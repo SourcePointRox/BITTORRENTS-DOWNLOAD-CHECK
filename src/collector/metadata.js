@@ -77,7 +77,10 @@ function _fetchPlaintext(ip, port, infohashHex) {
     const sock = new net.Socket();
     let buffer = Buffer.alloc(0);
     let hsDone = false, extDone = false;
-    let utId = null, metaSize = 0, got = Buffer.alloc(0), reqIndex = 0;
+    let utId = null, metaSize = 0, got = Buffer.alloc(0);
+    // 已收到的分片索引集合：用去重判定完成，避免重复/乱序响应让计数器提前达标、
+    // got 中残留零字节导致 SHA-1/SHA-256 校验失败（"校验效率为0"的根因）
+    const receivedPieces = new Set();
     const done = (v) => { try { sock.destroy(); } catch (_) {} resolve(v); };
     const timer = setTimeout(() => done(null), TIMEOUT);
 
@@ -135,7 +138,12 @@ function _fetchPlaintext(ip, port, infohashHex) {
             if (extId === EXT_HANDSHAKE_ID) {
               const h = bencode.decode(payload);
               if (h.m && h.m.ut_metadata) { utId = h.m.ut_metadata; metaSize = h.metadata_size || 0; }
-              if (utId && metaSize > 0 && metaSize < 16 * 1024 * 1024) { got = Buffer.alloc(metaSize); requestPiece(0); }
+              if (utId && metaSize > 0 && metaSize < 16 * 1024 * 1024) {
+                got = Buffer.alloc(metaSize);
+                // 流水线一次性请求全部分片：比逐分片往返更快，且不受响应乱序/重复影响
+                const total = Math.ceil(metaSize / BLOCK);
+                for (let i = 0; i < total; i++) requestPiece(i);
+              }
               else { clearTimeout(timer); return done(null); }
             } else if (extId === utId && utId != null) {
               // BEP-9 ut_metadata 数据消息：bencode header 字典 + 原始 piece 数据
@@ -149,11 +157,11 @@ function _fetchPlaintext(ip, port, infohashHex) {
               }
               if (d.msg_type === 1 && data.length > 0) { // data —— 写入对应分片
                 data.copy(got, piece * BLOCK);
+                receivedPieces.add(piece);
+                // 仅当所有不重复分片都已收到才算完成：避免重复响应让计数提前达标、
+                // got 中残留零字节导致 SHA-1/SHA-256 校验失败（"校验效率为0"的根因）
+                if (receivedPieces.size >= Math.ceil(metaSize / BLOCK)) { clearTimeout(timer); return done(got); }
               }
-              const pieces = Math.ceil(metaSize / BLOCK);
-              reqIndex++;
-              if (reqIndex < pieces) requestPiece(reqIndex);
-              else { clearTimeout(timer); return done(got); }
             }
           } else if (id === 5) { /* bitfield，忽略 */ }
           else if (id === 7) { /* piece，忽略 */ }
@@ -173,7 +181,10 @@ function fetchFromPeerMSE(ip, port, infohashHex) {
     const sock = new net.Socket();
     let buffer = Buffer.alloc(0);
     let hsDone = false;
-    let utId = null, metaSize = 0, got = Buffer.alloc(0), reqIndex = 0;
+    let utId = null, metaSize = 0, got = Buffer.alloc(0);
+    // 已收到的分片索引集合：用去重判定完成，避免重复/乱序响应让计数器提前达标、
+    // got 中残留零字节导致 SHA-1/SHA-256 校验失败（"校验效率为0"的根因）
+    const receivedPieces = new Set();
     let enc = null, dec = null;
     const done = (v) => { try { sock.destroy(); } catch (_) {} resolve(v); };
     const timer = setTimeout(() => done(null), TIMEOUT);
@@ -215,7 +226,12 @@ function fetchFromPeerMSE(ip, port, infohashHex) {
             if (extId === EXT_HANDSHAKE_ID) {
               const h = bencode.decode(payload);
               if (h.m && h.m.ut_metadata) { utId = h.m.ut_metadata; metaSize = h.metadata_size || 0; }
-              if (utId && metaSize > 0 && metaSize < 16 * 1024 * 1024) { got = Buffer.alloc(metaSize); requestPiece(0); }
+              if (utId && metaSize > 0 && metaSize < 16 * 1024 * 1024) {
+                got = Buffer.alloc(metaSize);
+                // 流水线一次性请求全部分片：比逐分片往返更快，且不受响应乱序/重复影响
+                const total = Math.ceil(metaSize / BLOCK);
+                for (let i = 0; i < total; i++) requestPiece(i);
+              }
               else { clearTimeout(timer); return done(null); }
             } else if (extId === utId && utId != null) {
               const r = decodeWithNext(payload, 0);
@@ -223,11 +239,13 @@ function fetchFromPeerMSE(ip, port, infohashHex) {
               const data = payload.slice(r.next);
               const piece = d.piece || 0;
               if (d.msg_type === 2) { clearTimeout(timer); return done(null); }
-              if (d.msg_type === 1 && data.length > 0) { data.copy(got, piece * BLOCK); }
-              const pieces = Math.ceil(metaSize / BLOCK);
-              reqIndex++;
-              if (reqIndex < pieces) requestPiece(reqIndex);
-              else { clearTimeout(timer); return done(got); }
+              if (d.msg_type === 1 && data.length > 0) {
+                data.copy(got, piece * BLOCK);
+                receivedPieces.add(piece);
+                // 仅当所有不重复分片都已收到才算完成：避免重复响应让计数提前达标、
+                // got 中残留零字节导致 SHA-1/SHA-256 校验失败（"校验效率为0"的根因）
+                if (receivedPieces.size >= Math.ceil(metaSize / BLOCK)) { clearTimeout(timer); return done(got); }
+              }
             }
           }
         }

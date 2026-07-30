@@ -1,12 +1,15 @@
 'use strict';
-/* GeoIP 模块：基于 ip-api.com 真实批量地理位置查询。
-   - 同步 lookup(ip)：内存缓存 → DB 缓存 → 未命中加入待查队列，返回临时占位
+/* GeoIP 模块：本地离线 MMDB 优先 + ip-api.com 在线兜底。
+   - 同步 lookup(ip)：内存缓存 → DB 缓存 → 本地 MMDB → 未命中加入待查队列，返回临时占位
    - 异步 flushPending()：批量查询 ip-api.com（每批 100 个，支持中文），写回 DB + 内存
-   - 定期 refresh()：对已缓存但超 30 天的 IP 重新查询
-   - 降级策略：API 失败时回退 demoResolve，保证服务不中断
+   - 定期 refresh()：对已缓存但超 30 天的 IP 重新查询（本地可解的直接刷新，不走在线）
+   - 降级策略：本地库未加载/未命中 → 在线 API；API 失败 → demoResolve 占位
    接口与旧版完全兼容：lookup/populationOf/penetrationOf/allCountries/countryName */
 const db = require('./db');
+const fs = require('fs');
+const path = require('path');
 const { ipToInt } = require('../common/util');
+const mmdb = require('./mmdb-reader');
 
 /* ---- 国家人口与网络普及率（用于统计页） ---- */
 const COUNTRY_POPULATION_MLN = {
@@ -63,6 +66,81 @@ function isPrivateIp(ip) {
 
 /* 私有 IP 的固定返回 */
 const PRIVATE_GEO = { cc: 'LO', country: 'Local', region: 'Private', city: 'LAN', lat: 0, lon: 0, isp: 'Private', continent: 'Local', timezone: 'local' };
+
+/* ---- 本地离线 MMDB 库（GeoLite2）----
+   优先加载 City 库（含城市/经纬度），其次 Country 库（仅国家）。
+   文件不存在或格式错误时静默降级到在线 API。
+   懒加载：首次 localLookup 时加载，避免影响启动速度。 */
+const GEOIP_DIR = path.join(__dirname, '..', '..', 'data', 'geoip');
+let localReader = null;       // MMDBReader 实例 | null
+let localReaderLoaded = false; // 是否已尝试加载（避免重复磁盘检查）
+let localHits = 0, localMisses = 0;
+
+function loadLocalReader() {
+  if (localReaderLoaded) return localReader;
+  localReaderLoaded = true;
+  /* 按优先级尝试：City（信息最全）→ Country（仅国家/洲） */
+  for (const name of ['GeoLite2-City.mmdb', 'GeoIP2-City.mmdb', 'GeoLite2-Country.mmdb', 'GeoIP2-Country.mmdb']) {
+    const fp = path.join(GEOIP_DIR, name);
+    if (fs.existsSync(fp)) {
+      localReader = mmdb.open(fp);
+      if (localReader) {
+        try { console.log(`[geo] local MMDB loaded: ${name} (${localReader.databaseType}, ip${localReader.ipVersion})`); } catch (_) {}
+        break;
+      }
+    }
+  }
+  if (!localReader) {
+    try { console.log('[geo] no local MMDB found, falling back to online API only'); } catch (_) {}
+  }
+  return localReader;
+}
+
+/* 从 MMDB names map 中取国家/洲名称，优先中文 → 英文 → 首个可用 */
+function pickName(names) {
+  if (!names || typeof names !== 'object') return '';
+  return names['zh-CN'] || names.zh || names.en || Object.values(names)[0] || '';
+}
+
+/* 将 MMDB 原始记录映射为内部统一格式（与 mapApiResult 一致） */
+function mapLocalResult(ip, rec) {
+  if (!rec) return null;
+  const country = rec.country || rec.registered_country || {};
+  const continent = rec.continent || {};
+  const city = rec.city || {};
+  const loc = rec.location || {};
+  const subs = rec.subdivisions;
+  const regionName = (subs && subs[0] && pickName(subs[0].names)) || pickName(city.names) || '';
+  const cc = country.iso_code || null;
+  if (!cc) return null; /* 无国家码视为未命中 */
+  return {
+    ip,
+    cc,
+    country: pickName(country.names) || 'Unknown',
+    region: regionName,
+    city: pickName(city.names) || 'Unknown',
+    lat: loc.latitude || 0,
+    lon: loc.longitude || 0,
+    timezone: loc.time_zone || '',
+    continent: continent.code || '',
+    isp: '', /* GeoLite2 免费版不含 ISP，留空由在线 API 补全（仅在 fallback 时） */
+    resolved_at: Date.now(),
+  };
+}
+
+/* 本地 MMDB 同步查询。命中返回标准格式记录，未命中返回 null。 */
+function localLookup(ip) {
+  const reader = loadLocalReader();
+  if (!reader) return null;
+  try {
+    const rec = reader.lookup(ip);
+    if (!rec) { localMisses++; return null; }
+    const mapped = mapLocalResult(ip, rec);
+    if (mapped) { localHits++; return mapped; }
+    localMisses++;
+    return null;
+  } catch (_) { localMisses++; return null; }
+}
 
 /* ---- 内存缓存 + DB 预编译语句 ---- */
 const memCache = new Map();
@@ -260,12 +338,23 @@ async function flushPending() {
   if (pendingQueue.size > 0) setTimeout(() => flushPending(), 500);
 }
 
-/* 定期刷新：对超 30 天未更新的 IP 重新查询 */
+/* 定期刷新：对超 30 天未更新的 IP 重新查询。
+   本地 MMDB 可解的 IP 直接刷新时间戳，不占在线配额。 */
 async function refresh() {
   const d = db.get();
   const cutoff = Date.now() - REFRESH_INTERVAL;
   const rows = d.prepare('SELECT ip FROM ip_geo WHERE resolved_at < ? OR resolved_at IS NULL LIMIT 100').all(cutoff);
-  for (const r of rows) pendingQueue.add(r.ip);
+  const upd = d.prepare('UPDATE ip_geo SET resolved_at=? WHERE ip=?');
+  for (const r of rows) {
+    const local = localLookup(r.ip);
+    if (local) {
+      // 本地命中：刷新 DB 时间戳 + 内存缓存，不加入在线队列
+      try { upd.run(Date.now(), r.ip); } catch (_) {}
+      memCache.set(r.ip, { ...local, _pending: false });
+    } else {
+      pendingQueue.add(r.ip);
+    }
+  }
   if (pendingQueue.size > 0) flushPending();
 }
 
@@ -287,7 +376,14 @@ function lookup(ip) {
     return out;
   }
 
-  // 未命中：加入待查队列，返回临时占位
+  // 本地离线 MMDB 查询（命中即写回 DB + 内存，不走在线队列）
+  const local = localLookup(ip);
+  if (local) {
+    storeResult(local);
+    return memCache.get(ip);
+  }
+
+  // 本地未命中（或本地库未加载）：加入待查队列，返回临时占位
   if (pendingQueue.size < 10000) pendingQueue.add(ip);
   const placeholder = { ip, ...demoResolve(ip) };
   memCache.set(ip, placeholder);
@@ -328,6 +424,7 @@ module.exports = {
   /* 暴露内部状态用于监控 */
   _stats: () => ({
     pending: pendingQueue.size, cached: memCache.size, flushing,
+    local: { loaded: !!localReader, hits: localHits, misses: localMisses },
     providers: Object.fromEntries(Object.entries(providerHealth).map(([k, h]) => [k, {
       available: h.cooldownUntil < Date.now(), ok: h.ok, fail: h.fail,
       cooldownSec: Math.max(0, Math.round((h.cooldownUntil - Date.now()) / 1000)),
