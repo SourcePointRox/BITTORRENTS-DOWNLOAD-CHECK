@@ -407,19 +407,19 @@ const PROBE_INFOHASH = '9c0463c2d21c4be33ec99cb907e7e58f9e6d16a7';
 const HARVEST_TRACKER_LIMIT = 60;
 
 /* 健康检查参数：两档策略。
-   - 快速首轮（fast）：80 并发 × 6s 超时 → 平衡速度与系统资源（避免 fd 耗尽导致误判死亡）
-   - 常规维护：60 并发 × 8s 超时 → 全量复查，给国际 tracker 足够响应时间
+   - 快速首轮（fast）：120 并发 × 6s 超时 → 平衡速度与系统资源（避免 fd 耗尽导致误判死亡）
+   - 常规维护：100 并发 × 8s 超时 → 全量复查，给国际 tracker 足够响应时间
    存活者优先复查，连续 3 次失败标记 dead，dead 每 3 轮降频复查 1 次。
    注意：并发过高（300）会导致系统 socket/fd 耗尽，反而让正常 tracker 超时被误判死亡。 */
-const HEALTH_CONCURRENCY = 60;
+const HEALTH_CONCURRENCY = 100;
 const HEALTH_TIMEOUT = 8000;
-const FAST_CONCURRENCY = 80;
+const FAST_CONCURRENCY = 120;
 const FAST_TIMEOUT = 6000;
 
 class TrackerManager {
   constructor(opts = {}) {
     this.trackers = new Map(); // url -> { url, alive, lastCheck, latency, fails, rounds }
-    this.checkInterval = opts.checkInterval || 600000; // 10 分钟全量复查一轮
+    this.checkInterval = opts.checkInterval || 180000; // 3 分钟全量复查一轮（v0.8.1：从 10 分钟缩短，确保 tracker 状态新鲜）
     /* 存活池容量上限：默认 10000，向五位数级别的全网实时 tracker 看齐。
        健康检查分批并发（每批 120），harvest 只取最快的若干个，因此大池不会造成请求风暴。 */
     this.maxTrackers = opts.maxTrackers || 10000;
@@ -457,11 +457,13 @@ class TrackerManager {
     return true;
   }
 
-  /* 两阶段启动：
+  /* 三阶段启动：
      Phase 1：立即对静态种子（18 个）做快速健康检查（<1s），harvest 立即有存活列表可用
      Phase 2：流式加载远程列表（每个源完成即添加 tracker），加载完成后立即触发
-              增量快速检查（onlyUnchecked，300 并发 3s 超时，4000 tracker ~40s 完成）
-     定时维护：10 分钟全量复查（120 并发 5s 超时），12 小时刷新远程列表 */
+              增量快速检查（onlyUnchecked，120 并发 6s 超时，4000 tracker ~40s 完成）
+     Phase 3：定时全量复查（3 分钟一轮，100 并发 8s 超时）—— 每轮检查全部 tracker，
+              存活者复查延迟，死亡者降频（每 3 轮 1 次），确保 tracker 状态新鲜
+     12 小时刷新远程列表并触发增量检查 */
   start() {
     if (this.started) return;
     this.started = true;
@@ -471,7 +473,7 @@ class TrackerManager {
     this.fetchLists().then(() => {
       this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
     }).catch(() => {});
-    // 定时全量复查
+    // Phase 3：定时全量复查（3 分钟一轮，检查全部 tracker，不只是 unchecked）
     this._checkTimer = setInterval(() => this.healthCheck().catch(() => {}), this.checkInterval);
     this._checkTimer.unref && this._checkTimer.unref();
     // 每 12 小时刷新远程列表并触发增量检查
@@ -537,8 +539,8 @@ class TrackerManager {
 
   /* 健康检查：对 tracker 发轻量 announce（numwant=1）探测存活。
      两种模式：
-     - 常规全量（默认）：120 并发 × 5s 超时，存活优先 + dead 降频（每 3 轮 1 次）
-     - 快速增量（fast + onlyUnchecked）：300 并发 × 3s 超时，仅检查未检 tracker（alive===null）
+     - 常规全量（默认）：100 并发 × 8s 超时，存活优先 + dead 降频（每 3 轮 1 次），每 3 分钟一轮
+     - 快速增量（fast + onlyUnchecked）：120 并发 × 6s 超时，仅检查未检 tracker（alive===null）
      快速模式用于启动后快速完成首轮健康检查，常规模式用于定时维护。
      两种模式使用独立锁，互不阻塞。 */
   async healthCheck(opts = {}) {

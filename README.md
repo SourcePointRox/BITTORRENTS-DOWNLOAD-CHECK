@@ -595,6 +595,33 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.8.1 — 2026-07-30
+
+> 监控 WebUI 交互修复 + Tracker 健康检查全面加强。
+
+#### 修复
+
+- **采集趋势时间窗口按钮颜色不切换（严重）**：
+  - **根因**：Vue 3 中 `:style` 绑定字符串值（三元表达式返回 CSS 字符串）与静态 `style` 属性合并时，`border:1px solid` 简写覆盖了 `:style` 中的 `border-color`，且字符串 `:style` 在 Vue 3 运行时编译器下响应式追踪不稳定
+  - **修复**：` :style` 字符串 → `:class` 绑定（`tw-active` / `tw-inactive`），CSS 类定义在全局样式块中；`curMins` 响应式变化直接驱动 `:class` 切换
+- **"添加 Tracker" 按钮点击无响应（严重）**：
+  - **根因**：`@click="showAddModal = true"` 内联赋值在 Vue 3 运行时编译器（vue.global.prod.js）下对 ref 的写入操作不稳定，`v-if="showAddModal"` 不触发渲染
+  - **修复**：内联赋值 → 方法调用 `@click="openAddModal"` / `@click="closeAddModal"`，方法内部显式 `showAddModal.value = true/false`
+
+#### 优化
+
+- **Tracker 健康检查全面加强**：
+  - 检查间隔从 10 分钟缩短至 **3 分钟**（确保 tracker 状态新鲜）
+  - 定时复查从 `onlyUnchecked`（仅查未检）改为 **全量复查**（每轮检查全部 tracker，存活优先 + dead 每 3 轮降频 1 次）
+  - 常规并发从 60 提升至 **100**，快速并发从 80 提升至 **120**（更快完成全量检查）
+  - 确保不再出现"只检前 9 个"的问题：定时器每 3 分钟触发 `healthCheck()`（无 `onlyUnchecked`），全量遍历整个 tracker 池
+
+#### 验证
+
+- 140 项测试全部通过（30 unit + 59 e2e + 18 stress + 33 admin）
+
+---
+
 ### v0.8.0 — 2026-07-30
 
 > 前端现代化：监控 WebUI 全面重写为 Vue 3 + TailwindCSS，主站点迁移至 TailwindCSS，移除 jQuery / Bootstrap 依赖。
