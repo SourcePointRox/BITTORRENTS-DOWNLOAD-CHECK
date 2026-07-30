@@ -95,11 +95,13 @@ async function main() {
   const chartBody = await chartJs.text();
   ok('Chart.js 内容非空', chartBody.length > 10000, `len=${chartBody.length}`);
 
-  // 5.2 仪表盘页面
+  // 5.2 仪表盘页面（HTML 壳 + 外部 dashboard.js Vue 应用）
   const dashPage = await fetch(MB + '/');
   ok('监控仪表盘 200', dashPage.status === 200);
   const dashHtml = await dashPage.text();
-  ok('仪表盘含 24h 趋势按钮', dashHtml.includes('data-mins="1440"') && dashHtml.includes('24h'));
+  // dashboard.js 是外部 Vue 应用文件，24h 趋势按钮在其中定义
+  const dashJs = await fetch(MB + '/assets/js/dashboard.js').then(r => r.text());
+  ok('仪表盘含 24h 趋势按钮', dashJs.includes('data-mins="1440"') && dashJs.includes('24h'));
 
   // 5.3 /api/stats 轻量面板数据完整性（重图表数据已拆分到 /api/charts）
   const ms = await fetch(MB + '/api/stats?mins=60').then(r => r.json());

@@ -27,9 +27,10 @@ CREATE INDEX IF NOT EXISTS idx_cold_v1 ON torrents(infohash_v1);
 CREATE INDEX IF NOT EXISTS idx_cold_v2 ON torrents(infohash_v2);
 `;
 
-const DEFAULT_POLL = 10000; // 10s
-const SYNC_BATCH = 1000;    // 每次同步最多拉取的主库行数
-const BACKFILL_BATCH = 100; // 每次回填最多处理的空 name 行数
+const DEFAULT_POLL = 3000;  // 3s（v0.8.5：从 10s 缩短，加速初始全量同步）
+const SYNC_BATCH = 10000;   // 每次同步拉取的主库行数（v0.8.5：从 1000 提升 10x，加速初始全量同步）
+const SYNC_BATCH_FAST = 50000; // 初始全量扫描阶段使用更大批次
+const BACKFILL_BATCH = 500; // 每次回填最多处理的空 name 行数（v0.8.5：从 100 提升）
 
 class ColdStorage {
   constructor(opts = {}) {
@@ -63,8 +64,9 @@ class ColdStorage {
     this._coldDb.exec('PRAGMA busy_timeout = 5000;');
     this._coldDb.exec(SCHEMA);
 
-    // 主库：只读（WAL 模式下可并发读取）
-    this._mainDb = new DatabaseSync(this.mainDbPath, { readOnly: true });
+    // 主库：读写连接（与主进程共享 WAL，readOnly 模式下无法读取 WAL 中的最新数据）
+    this._mainDb = new DatabaseSync(this.mainDbPath);
+    this._mainDb.exec('PRAGMA journal_mode = WAL;');
     this._mainDb.exec('PRAGMA busy_timeout = 5000;');
 
     this._stmts = {
@@ -181,8 +183,8 @@ class ColdStorage {
     let isInitial = this._initRowid !== null;
 
     if (isInitial) {
-      // 初始全量扫描：按 rowid 游标分批拉取
-      rows = this._stmts.getMainByRowid.all(this._initRowid, SYNC_BATCH);
+      // 初始全量扫描：按 rowid 游标分批拉取（使用更大批次加速）
+      rows = this._stmts.getMainByRowid.all(this._initRowid, SYNC_BATCH_FAST);
       if (rows.length === 0) {
         // 初始扫描完成，切换到增量模式
         this._initRowid = null;
@@ -259,6 +261,9 @@ class ColdStorage {
     if (this.running) return;
     this._open();
     this.running = true;
+    const mainCount = this._stmts.countMain.get().c;
+    const coldCount = this._stmts.countCold.get().c;
+    console.log(`[cold-storage] started: main=${mainCount} cold=${coldCount} poll=${this.pollInterval}ms`);
     // 立即同步一次
     this._tick();
     this.timer = setInterval(() => this._tick(), this.pollInterval);
@@ -268,8 +273,8 @@ class ColdStorage {
   _tick() {
     try {
       const r = this.syncOnce();
-      if (r.inserted > 0 || r.updated > 0) {
-        console.log(`[cold-storage] synced +${r.inserted} updated ${r.updated} (scanned ${r.scanned})`);
+      if (r.inserted > 0 || r.updated > 0 || r.initial) {
+        console.log(`[cold-storage] synced +${r.inserted} updated ${r.updated} backfilled ${r.backfilled} (scanned ${r.scanned}, initial=${r.initial})`);
       }
     } catch (e) {
       console.error('[cold-storage] sync error:', e.message);
@@ -293,7 +298,7 @@ class ColdStorage {
     }
     return {
       total,
-      synced: this.syncedCount,
+      synced: total,
       pending: Math.max(0, mainTotal - total),
       lastSync: this.lastSync,
       dbPath: this.dbPath,

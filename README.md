@@ -595,6 +595,58 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.8.4 — 2026-07-31
+
+> 监控 WebUI 全面修复：采集器控制端点缺失 + 冷存储 readOnly 无法读取 WAL + Tracker 健康检查停滞 + 内存趋势图空白 + 实时数据刷新缓存。
+
+#### P0 修复（严重）
+
+- **采集器控制按钮完全失效（P0）**：
+  - **根因**：`dashboard.js` 的 `ctlCollector()` 调用 `POST /api/collector`，但 `monitor.js` 中**不存在该端点**（仅 `admin.js` 有 `/admin/api/collector`，运行在主站点端口而非监控端口）。用户点击"启动模拟采集"/"启动真实DHT采集"/"停止采集"按钮后，fetch 返回 404，采集器不会启动/停止，导致所有依赖采集器的功能（事件流、DHT节点、tracker列表、冷存储同步）全部无数据
+  - **修复**：`monitor.js` 新增 `POST /api/collector` 端点（start-sim / start-live / stop），调用 `collectorRef` 对应方法并返回最新 `lightStats()` 供前端立即刷新；同时新增 `POST /api/burst` 端点
+  - **验证**：点击控制按钮后采集器立即启动/停止，事件流/DHT/tracker 数据在 2s 内出现
+
+- **冷存储同步为 0（P0）**：
+  - **根因**：`cold-storage.js` 使用 `{ readOnly: true }` 打开主库连接。SQLite WAL 模式下，readOnly 连接**无法读取 WAL 文件中的最新数据**（WAL 文件需要写权限才能 checkpoint），导致冷存储进程看到的主库 torrent 数为 0，所有 INSERT 被跳过（`alreadySynced` 判定为空集），`synced` 计数始终为 0
+  - **修复**：移除 `readOnly: true`，改为读写连接（`new DatabaseSync(mainDbPath)`），确保能读取 WAL 中的最新数据；同时 `service.js` 中 `pollInterval` 从 10000ms 缩短为 3000ms 加速初始同步
+  - **验证**：启动后 `main=N cold=0` → 3s 后 `synced +N`，`getStats().synced` 正确反映冷库实际条目数
+
+- **Tracker 健康检查停在少量条目（P0）**：
+  - **根因**：`fetchLists()` 下载 30+ 个远程 tracker 列表源（每个 12s 超时），总耗时可达 30-60s。在此期间新加入的 tracker（alive=null）不会被检查，直到 `fetchLists()` 全部完成后才触发一次 `healthCheck({onlyUnchecked})`。如果部分源下载失败，总 tracker 数停留在少量（如 63 个），用户看到"查到 63 个就不查了"
+  - **修复**：新增 Phase 2.5 定时扫描——每 30s 检查是否存在 `alive===null` 的 tracker，如有则立即触发增量健康检查（`onlyUnchecked`）。这确保 `fetchLists()` 进行中时新加入的 tracker 也能被及时检查，不再等待全部源下载完成
+  - **验证**：启动后 30s 内开始检查远程 tracker，unchecked 计数持续下降
+
+#### P1 修复（功能）
+
+- **内存趋势图不显示**：
+  - **根因**：Chart.js 初始化时 `data` 为空数组 + `pointRadius: 0`，仅有 1 个数据点时线图无可绘制内容（需要 ≥2 点才能画线，且点半径为 0 时单点不可见）
+  - **修复**：初始化时填充 `[0]` 占位数据；数据点 < 2 时补 `[0, currentValue]` 确保至少 2 点；`pointRadius` 从 0 改为 2（小数据集时可见）
+
+- **API 响应被浏览器缓存**：
+  - **根因**：`monitor.js` 的 `json()` 函数未设置 `Cache-Control` 头，浏览器可能缓存 API 响应导致前端显示旧数据
+  - **修复**：所有 API JSON 响应添加 `Cache-Control: no-cache, no-store, must-revalidate` + `Pragma: no-cache` + `Expires: 0`
+
+- **DHT 路由表节点 v-for key 重复**：
+  - **根因**：使用数组索引 `:key="i"` 作为 v-for key，节点列表更新时 Vue 可能复用错误 DOM 导致渲染异常
+  - **修复**：改用 `:key="n.id + '_' + n.address"` 复合 key 确保唯一性
+
+- **系统资源模块宽度不一致**：
+  - **根因**：`grid-events` 在 `@media(max-width:1400px)` 下变为 2 列，而上方的 `grid-2-1` 保持 2:1 比例，导致系统资源卡片宽度与上方模块不对齐
+  - **修复**：`grid-events` 在 ≥ 1100px 时保持 3 等列（与 `grid-2-1` 的 1fr 部分对齐），仅 < 1100px 时改为 1 列
+
+- **添加 Tracker 按钮错误处理**：
+  - **根因**：`submitAddTrackers()` 对非 200 响应未正确处理，用户看不到错误信息
+  - **修复**：添加 `r.ok` 守卫，非 200 响应时解析错误体并显示"添加失败: ..."提示
+
+- **元数据解析速度**：
+  - **修复**：`_queueMeta` / `_pumpMeta` 并发上限从 10 提升至 20；`_retryMeta` 每次处理 5 个 hash（原 1 个）
+
+#### 验证
+
+- 123 项测试全部通过（30 unit + 34 admin + 59 e2e）
+
+---
+
 ### v0.8.3 — 2026-07-30
 
 > 监控 WebUI 交互失效根因修复：Vue 运行时缺少模板编译器。

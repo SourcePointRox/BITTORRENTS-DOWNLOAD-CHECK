@@ -419,7 +419,7 @@ const FAST_TIMEOUT = 6000;
 class TrackerManager {
   constructor(opts = {}) {
     this.trackers = new Map(); // url -> { url, alive, lastCheck, latency, fails, rounds }
-    this.checkInterval = opts.checkInterval || 180000; // 3 分钟全量复查一轮（v0.8.1：从 10 分钟缩短，确保 tracker 状态新鲜）
+    this.checkInterval = opts.checkInterval || 120000; // 2 分钟全量复查一轮（v0.8.4：从 3 分钟缩短，确保 tracker 状态新鲜）
     /* 存活池容量上限：默认 10000，向五位数级别的全网实时 tracker 看齐。
        健康检查分批并发（每批 120），harvest 只取最快的若干个，因此大池不会造成请求风暴。 */
     this.maxTrackers = opts.maxTrackers || 10000;
@@ -429,6 +429,7 @@ class TrackerManager {
     this._fetchTimer = null;
     this._checking = false;          // 全量检查锁
     this._checkingUnchecked = false; // 增量检查锁（仅查未检 tracker）
+    this._pendingUnchecked = false; // 有待处理的增量检查（Phase2 被 Phase1 阻塞时标记，Phase1 完成后自动重试）
     this._deadRound = 0;
     this.started = false;
     this.firstCheckDone = false;     // 首轮快速检查是否完成
@@ -461,7 +462,7 @@ class TrackerManager {
      Phase 1：立即对静态种子（18 个）做快速健康检查（<1s），harvest 立即有存活列表可用
      Phase 2：流式加载远程列表（每个源完成即添加 tracker），加载完成后立即触发
               增量快速检查（onlyUnchecked，120 并发 6s 超时，4000 tracker ~40s 完成）
-     Phase 3：定时全量复查（3 分钟一轮，100 并发 8s 超时）—— 每轮检查全部 tracker，
+     Phase 3：定时全量复查（2 分钟一轮，100 并发 8s 超时）—— 每轮检查全部 tracker，
               存活者复查延迟，死亡者降频（每 3 轮 1 次），确保 tracker 状态新鲜
      12 小时刷新远程列表并触发增量检查 */
   start() {
@@ -473,7 +474,16 @@ class TrackerManager {
     this.fetchLists().then(() => {
       this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
     }).catch(() => {});
-    // Phase 3：定时全量复查（3 分钟一轮，检查全部 tracker，不只是 unchecked）
+    // Phase 2.5：定期扫描未检 tracker（fetchLists 进行中或完成后都能持续检查新加入的）
+    this._sweepTimer = setInterval(() => {
+      let hasUnchecked = false;
+      for (const info of this.trackers.values()) {
+        if (info.alive === null) { hasUnchecked = true; break; }
+      }
+      if (hasUnchecked) this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
+    }, 30000);
+    this._sweepTimer.unref && this._sweepTimer.unref();
+    // Phase 3：定时全量复查（2 分钟一轮，检查全部 tracker，不只是 unchecked）
     this._checkTimer = setInterval(() => this.healthCheck().catch(() => {}), this.checkInterval);
     this._checkTimer.unref && this._checkTimer.unref();
     // 每 12 小时刷新远程列表并触发增量检查
@@ -489,6 +499,7 @@ class TrackerManager {
     this.started = false;
     if (this._checkTimer) { clearInterval(this._checkTimer); this._checkTimer = null; }
     if (this._fetchTimer) { clearInterval(this._fetchTimer); this._fetchTimer = null; }
+    if (this._sweepTimer) { clearInterval(this._sweepTimer); this._sweepTimer = null; }
   }
 
   /* 拉取单个远程源的原始文本。超时 12s（文本文件，无需 20s）。 */
@@ -551,7 +562,13 @@ class TrackerManager {
 
     // 独立锁：全量和增量互不阻塞
     if (!onlyUnchecked && this._checking) return;
-    if (onlyUnchecked && this._checkingUnchecked) return;
+    if (onlyUnchecked && this._checkingUnchecked) {
+      // v0.8.6：标记有待处理的增量检查。当前检查完成后自动重试，
+      // 解决 Phase1（静态种子检查）还在运行时 Phase2（远程列表加载后检查）
+      // 被跳过导致大量 tracker 停留在"未检"状态的问题。
+      this._pendingUnchecked = true;
+      return;
+    }
 
     if (onlyUnchecked) this._checkingUnchecked = true;
     else { this._checking = true; this._deadRound++; }
@@ -596,13 +613,18 @@ class TrackerManager {
               info.fails = 0;
               this._healthProgress.alive++;
             } else {
+              // 首次失败即标记 dead：避免 tracker 长期停留在 alive=null（"未检"）状态，
+              // 让监控 WebUI 的存活/死亡/未检计数真实反映检查进度。
+              // dead tracker 仍会由全量复查定期重试（每 3 轮 1 次），恢复后自动转回 alive。
               info.fails = (info.fails || 0) + 1;
-              if (info.fails >= 3) { info.alive = false; this._healthProgress.dead++; }
+              info.alive = false;
+              this._healthProgress.dead++;
             }
           } catch (_) {
             info.lastCheck = Date.now();
             info.fails = (info.fails || 0) + 1;
-            if (info.fails >= 3) { info.alive = false; this._healthProgress.dead++; }
+            info.alive = false;
+            this._healthProgress.dead++;
           }
           this._healthProgress.checked++;
         }
@@ -616,6 +638,21 @@ class TrackerManager {
       if (onlyUnchecked) this._checkingUnchecked = false;
       else this._checking = false;
       this._healthProgress = null;
+    }
+
+    // v0.8.6：检查完成后，如果有待处理的增量检查（Phase2 被 Phase1 阻塞时标记），
+    // 自动重试。这是修复"tracker 健康检查停在少量条目"的关键：
+    // Phase1（18 个静态种子）还在运行时 fetchLists 已完成并调用 healthCheck，
+    // 旧代码直接 return 跳过，导致远程加载的 3000+ 个 tracker 永远不会被检查。
+    if (onlyUnchecked && this._pendingUnchecked) {
+      this._pendingUnchecked = false;
+      let hasUnchecked = false;
+      for (const info of this.trackers.values()) {
+        if (info.alive === null) { hasUnchecked = true; break; }
+      }
+      if (hasUnchecked) {
+        setImmediate(() => this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {}));
+      }
     }
   }
 
@@ -664,7 +701,7 @@ class TrackerManager {
     const stats = { total, alive, dead, unchecked: total - alive - dead,
       avgLatency: latN ? Math.round(latSum / latN) : 0,
       sources: this.sources.length, maxTrackers: this.maxTrackers,
-      checking: this._checking,
+      checking: this._checking || this._checkingUnchecked,
       firstCheckDone: this.firstCheckDone,
       lastFetchAt: this.lastFetch.at, fetchSources: this.lastFetch.sources };
     // 健康检查进度（检查进行中时返回实时进度）

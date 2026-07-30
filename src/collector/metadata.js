@@ -320,8 +320,8 @@ async function resolveAndStore(infohashHex, peersList) {
   const infohash = normalizeInfohash(infohashHex);
   if (!infohash) return null;
   const isV2 = isV2Infohash(infohash);
-  // 并行尝试最多 20 个 peer，取第一个 hash 匹配的结果
-  const candidates = peersList.slice(0, 20);
+  // 并行尝试最多 40 个 peer，取第一个 hash 匹配的结果
+  const candidates = peersList.slice(0, 40);
   diag.total += candidates.length;
   const tasks = candidates.map(p =>
     fetchFromPeerAuto(p.ip, p.port, infohash).then(raw => ({ raw, peer: p }))

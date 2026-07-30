@@ -68,6 +68,13 @@ class CollectorService {
     this.geoFlushTimer.unref && this.geoFlushTimer.unref();
     this.geoBackfillTimer = setInterval(() => geo.backfillCountryDaily(), 30000);
     this.geoBackfillTimer.unref && this.geoBackfillTimer.unref();
+    /* sim 模式也启动 Tracker 管理器：让监控 WebUI 的 tracker 列表/健康检查/手动添加
+       功能完整可用（用户在 sim 模式下也需要验证 tracker 健康度）。
+       tracker 健康检查是独立的网络探测，不依赖 DHT/PEX，可在 sim 模式下安全运行。 */
+    if (opts.tracker !== false) {
+      this.trackerMgr = new tracker.TrackerManager();
+      this.trackerMgr.start();
+    }
     this._startColdStorage();
     return { mode: this.mode };
   }
@@ -158,9 +165,10 @@ class CollectorService {
   _startColdStorage() {
     try {
       const { ColdStorage } = require('./cold-storage');
-      this.coldStorage = new ColdStorage({ pollInterval: 10000 });
+      this.coldStorage = new ColdStorage({ pollInterval: 3000 });
       this.coldStorage.start();
-    } catch (e) { console.log('[cold-storage] 启动失败:', e.message); }
+      console.log('[cold-storage] started, poll=3000ms');
+    } catch (e) { console.error('[cold-storage] 启动失败:', e.message); }
   }
 
   /* ---------- 内部 ---------- */
@@ -176,13 +184,13 @@ class CollectorService {
   }
 
   _queueMeta(infohash) {
-    if (this.metaQueue.length > 400 || this.metaWorking > 5) return;
+    if (this.metaQueue.length > 400 || this.metaWorking > 20) return;
     this.metaQueue.push(infohash);
     this._pumpMeta();
   }
 
   async _pumpMeta() {
-    if (this.metaWorking > 5) return;
+    if (this.metaWorking > 20) return;
     const ih = this.metaQueue.shift();
     if (!ih) return;
     this.metaWorking++;
@@ -289,19 +297,20 @@ class CollectorService {
   }
 
   _retryMeta() {
-    if (this.metaWorking > 5) return;
+    if (this.metaWorking > 20) return;
     const d = db.get();
-    const row = d.prepare(`
+    const rows = d.prepare(`
       SELECT t.infohash, COUNT(o.id) AS pc,
         SUM(CASE WHEN o.source = 'dht_passive' THEN 1 ELSE 0 END) AS ap
       FROM torrents t
       JOIN obs_log o ON o.infohash = t.infohash AND o.port IS NOT NULL
       WHERE t.metadata_ok = 0 AND t.name IS NULL
       GROUP BY t.infohash HAVING pc >= 3
-      ORDER BY ap DESC, pc DESC LIMIT 1
-    `).get();
-    if (!row) return;
-    this.metaQueue.push(row.infohash);
+      ORDER BY ap DESC, pc DESC LIMIT 5
+    `).all();
+    for (const row of rows) {
+      this.metaQueue.push(row.infohash);
+    }
     this._pumpMeta();
   }
 
