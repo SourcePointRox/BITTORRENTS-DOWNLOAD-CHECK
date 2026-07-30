@@ -595,6 +595,23 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.8.3 — 2026-07-30
+
+> 监控 WebUI 交互失效根因修复：Vue 运行时缺少模板编译器。
+
+#### P0 修复（严重）
+
+- **监控 WebUI 所有交互失效（P0，含添加 Tracker 按钮无响应）**：
+  - **根因**：`public/assets/js/vue.global.prod.js` 是 Vue 3 的 **runtime-only 构建**（147KB），不含模板编译器。监控 WebUI 使用字符串模板 `template: '<div>...'`，需要运行时将模板字符串编译为渲染函数。runtime-only 构建无法编译字符串模板 → Vue 应用挂载失败 → **所有交互（按钮点击、v-model、v-if、轮询数据绑定）全部失效**，但静态 HTML 已注入 DOM 所以页面看起来有内容
+  - **修复**：下载 Vue 3 完整构建 `vue.global.js`（587KB，含编译器），替换 `vue.global.prod.js`。`monitor.js` 中 `<script src>` 引用更新
+  - **验证**：Vue 应用正确挂载，按钮点击、模态框 v-if、轮询数据绑定全部正常工作
+
+#### 验证
+
+- 140 项测试全部通过（30 unit + 59 e2e + 18 stress + 33 admin）
+
+---
+
 ### v0.8.2 — 2026-07-30
 
 > 监控 WebUI P0 级缺陷修复：空白页崩溃 + 模块不刷新 + 布局溢出。

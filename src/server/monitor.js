@@ -345,7 +345,7 @@ function dashboardHtml() {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BITTORRENTS 网络监控中心</title>
 <script src="/assets/js/chart.umd.min.js"></script>
-<script src="/assets/js/vue.global.prod.js"></script>
+<script src="/assets/js/vue.global.js"></script>
 <script src="/assets/js/tailwind.js"></script>
 <script>
   /* TailwindCSS 暗色主题配置 */
