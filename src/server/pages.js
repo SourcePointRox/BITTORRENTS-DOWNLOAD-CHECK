@@ -14,11 +14,10 @@ function layout({ title, description, content, headExtra = '', bodyExtra = '' })
     <meta name="description" content="${esc(description || title)}">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="stylesheet" href="/assets/css/bootstrap.min.css">
+<link rel="stylesheet" href="/assets/css/tailwind-custom.css">
 <link rel="stylesheet" href="/assets/css/font-awesome.min.css">
 <link href="/assets/css/v2.css" rel="stylesheet">
 <link rel="icon" type="image/svg+xml" href="/assets/img/logo.svg" />
-<script src="/assets/js/bootstrap.bundle.min.js"></script>
 <script src="/assets/js/chart.umd.min.js"></script>
 <script src="/assets/js/iknow.js"></script>
 <meta http-equiv="content-type" content="text/html;charset=UTF-8">
@@ -26,10 +25,81 @@ ${headExtra}</head>
 <body>
 <script>
     document.addEventListener('DOMContentLoaded', function() {
+        // 导航高亮：当前路径对应的 nav-link 加 active
         var path = this.location.pathname;
         document.querySelectorAll('.navbar-nav .nav-link').forEach(function(a) {
             if (a.getAttribute('href') === path) a.classList.add('active');
         });
+
+        // Bootstrap data-api 兼容层（替代 bootstrap.bundle.min.js）
+        // 支持 collapse（navbar 折叠）、tab（Top 选项卡）、modal（国家/日期弹窗）
+        document.addEventListener('click', function (e) {
+            var t = e.target.closest && e.target.closest('[data-bs-toggle]');
+            if (t) {
+                var type = t.getAttribute('data-bs-toggle');
+                if (type === 'collapse') {
+                    var csel = t.getAttribute('data-bs-target');
+                    var ctgt = csel && document.querySelector(csel);
+                    if (ctgt) {
+                        var shown = ctgt.classList.toggle('show');
+                        t.classList.toggle('collapsed', !shown);
+                        t.setAttribute('aria-expanded', shown ? 'true' : 'false');
+                    }
+                } else if (type === 'tab') {
+                    e.preventDefault();
+                    var list = t.closest('[role="tablist"]');
+                    var content = list && list.parentElement && list.parentElement.querySelector('.tab-content');
+                    if (list) list.querySelectorAll('.nav-link').forEach(function (a) { a.classList.remove('active'); });
+                    t.classList.add('active');
+                    if (content) {
+                        content.querySelectorAll('.tab-pane').forEach(function (p) { p.classList.remove('active'); });
+                        var href = t.getAttribute('href') || '';
+                        if (href.charAt(0) === '#') {
+                            var pane = content.querySelector(href);
+                            if (pane) pane.classList.add('active');
+                        }
+                    }
+                } else if (type === 'modal') {
+                    // 兼容 data-bs-target（BS5）与历史 data-target（BS4）两种写法
+                    var msel = t.getAttribute('data-bs-target') || t.getAttribute('data-target');
+                    var modal = msel && document.querySelector(msel);
+                    if (modal) openModal(modal);
+                }
+                return;
+            }
+            var d = e.target.closest && e.target.closest('[data-bs-dismiss="modal"]');
+            if (d) {
+                var m = d.closest('.modal');
+                if (m) closeModal(m);
+            }
+        });
+
+        // ESC 关闭弹窗
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') {
+                var open = document.querySelector('.modal.show');
+                if (open) closeModal(open);
+            }
+        });
+
+        function openModal(m) {
+            m.classList.add('show');
+            m.style.display = 'block';
+            if (!m._backdrop) {
+                var back = document.createElement('div');
+                back.className = 'modal-backdrop show';
+                m.parentNode.appendChild(back);
+                m._backdrop = back;
+                back.addEventListener('click', function () { closeModal(m); });
+            }
+            document.body.classList.add('modal-open');
+        }
+        function closeModal(m) {
+            m.classList.remove('show');
+            m.style.display = '';
+            if (m._backdrop) { m._backdrop.remove(); m._backdrop = null; }
+            document.body.classList.remove('modal-open');
+        }
     });
 </script>
 <nav class="navbar navbar-expand-lg navbar-light site-nav" itemscope itemtype="http://www.schema.org/SiteNavigationElement">

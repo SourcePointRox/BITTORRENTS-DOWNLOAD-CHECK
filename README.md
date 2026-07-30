@@ -25,7 +25,7 @@ BitTorrent 网络元数据抓取与采集监控系统 —— 全量接入全球 
 - **长跑稳定**：TTL 化去重 Map（25h 过期）+ obs_log 30 天 TTL + 写队列批处理（500ms / 50 条）+ WAL 模式 + obs_log ts 复合索引
 - **Web 站点**：完整复刻 iknowwhatyoudownload.com 全站功能，正式化 UI（修复 logo 裁剪、导航/按钮比例、卡片阴影、深色页脚）
 - **REST API**：对齐官方 Peer/Torrent/Content API，免 Key 沙箱模式
-- **监控 WebUI**：独立端口，分步加载（轻量 stats / 重量 charts / 全量 trackers 独立端点防卡死）、Top 国家扇形图、全量 tracker 滚动列表（存活在前）、GeoIP/聚合源健康面板、爬虫/WebSeed 统计
+- **监控 WebUI**：Vue 3 + TailwindCSS 响应式应用，独立端口，分步加载（轻量 stats / 重量 charts / 全量 trackers 独立端点防卡死）、Top 国家扇形图、全量 tracker 滚动列表（存活在前）、GeoIP/聚合源健康面板、爬虫/WebSeed 统计
 - **自动端口检测**：默认端口被占用时自动切换到可用端口
 
 ## 快速开始
@@ -401,7 +401,7 @@ node -e "async function t(){const ips=['8.8.8.8','114.114.114.114','218.26.74.1'
 
 ## 监控 WebUI
 
-独立运行在单独端口的监控面板，**API 分层 + 分步加载**（v0.6.0 重构，防卡死）：
+独立运行在单独端口的监控面板，**Vue 3 + TailwindCSS 响应式应用**（v0.8.0 前端现代化重写），**API 分层 + 分步加载**（v0.6.0 重构，防卡死）：
 
 | 模块 | 内容 |
 |---|---|
@@ -588,12 +588,48 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 - ML 分类：TF-IDF + Softmax 多项逻辑回归（纯 JS 实现）
 - GeoIP：ip-api.com 主源 + freeipapi/ipwho.is/ipapi.co 备用熔断轮换（三层缓存）
 - 元数据聚合：SolidTorrents / Knaben / apibay / torrentz2 / BT4G 多源熔断轮换
-- 前端：Bootstrap 5 + Chart.js 4（全部本地化，无 jQuery）
+- 前端：Vue 3 + TailwindCSS + Chart.js 4（全部本地化，无 jQuery，无 Bootstrap 依赖）
 - 存储：SQLite (WAL 模式) + 独立冷存储 SQLite + obs_log ts 复合索引
 
 ---
 
 ## 更新日志
+
+### v0.8.0 — 2026-07-30
+
+> 前端现代化：监控 WebUI 全面重写为 Vue 3 + TailwindCSS，主站点迁移至 TailwindCSS，移除 jQuery / Bootstrap 依赖。
+
+#### 重构
+
+- **监控 WebUI（Vue 3 + TailwindCSS 全面重写）**：
+  - 从 Bootstrap 3 + jQuery + 内联脚本迁移到 **Vue 3**（`createApp` + `ref` / `computed` / `onMounted`）响应式应用
+  - TailwindCSS Play CDN 引入，自定义暗色主题色板（`bg-base` / `bg-card` / `accent-green` 等 12 色），与原外观完全一致
+  - 模板字符串拼接替代模板字面量（避免嵌套 `` ` `` 语法错误），Vue 组件 `setup()` 返回响应式状态 + 计算属性 + 方法
+  - 时间窗口按钮改为静态 `data-mins` 属性（15m/1h/3h/6h/12h/24h），保留 `@click="setMins()"` 响应式切换
+  - Chart.js 图表保留 `chart.update()` 平滑过渡，内存趋势曲线、来源堆叠面积图、国家分布 doughnut 全部兼容
+  - 手动添加 Tracker 弹窗改为 Vue `v-model` + `v-if` 响应式管理
+- **主站点 SSR 迁移至 TailwindCSS**：
+  - `src/server/pages.js` 从 Bootstrap 类迁移到 TailwindCSS utility classes + 自定义 CSS
+  - 修复 logo 裁剪、导航/按钮比例、卡片阴影、深色页脚样式
+
+#### 修复
+
+- **monitor.js 模板字面量闭合错误（严重）**：
+  - **根因**：`</html>\`;\`` 中 `\`` 是转义反引号（字面量），模板字面量从未闭合，导致后续 `console.log(\`...\`)` 被吞入模板字符串
+  - **修复**：`\`` → `` ` ``（移除转义反斜杠），模板字面量正确闭合
+
+#### 新增
+
+- `public/assets/js/vue.global.prod.js`：Vue 3 生产构建（本地化）
+- `public/assets/js/tailwind.js`：TailwindCSS Play CDN（本地化）
+- `public/assets/css/tailwind-custom.css`：自定义暗色主题补充样式
+
+#### 验证
+
+- 140 项测试全部通过（30 unit + 59 e2e + 18 stress + 33 admin）
+- 语法校验：monitor.js / pages.js / api.js / db.js / cold-storage.js / metadata.js / pipeline.js / service.js / start.js 全部通过
+
+---
 
 ### v0.7.0 — 2026-07-30
 
