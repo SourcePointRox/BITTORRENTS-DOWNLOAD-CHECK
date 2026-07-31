@@ -2,6 +2,9 @@
 setlocal enabledelayedexpansion
 title BITTORRENTS-DOWNLOAD-CHECK Launcher
 
+REM Switch to this .bat file's directory (fixes "Cannot find module" when double-clicked from explorer)
+cd /d "%~dp0"
+
 echo ===============================================================
 echo   BITTORRENTS-DOWNLOAD-CHECK  Full Service Launcher
 echo   DHT + PEX + Tracker + BEP-52 v2/hybrid + MSE/PE + IPv6
