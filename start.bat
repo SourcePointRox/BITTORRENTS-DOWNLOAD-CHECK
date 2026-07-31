@@ -1,64 +1,65 @@
 @echo off
-chcp 65001 >nul 2>&1
-title BITTORRENTS-DOWNLOAD-CHECK 全量服务启动器
+setlocal enabledelayedexpansion
+title BITTORRENTS-DOWNLOAD-CHECK Launcher
 
-echo ╔═══════════════════════════════════════════════════════════╗
-echo ║   BITTORRENTS-DOWNLOAD-CHECK  全量服务启动                  ║
-echo ║   DHT + PEX + Tracker + BEP-52 v2/hybrid + MSE/PE + IPv6   ║
-echo ╚═══════════════════════════════════════════════════════════╝
+echo ===============================================================
+echo   BITTORRENTS-DOWNLOAD-CHECK  Full Service Launcher
+echo   DHT + PEX + Tracker + BEP-52 v2/hybrid + MSE/PE + IPv6
+echo ===============================================================
 echo.
 
-REM ---- 检查 Node.js ----
+REM ---- Check Node.js ----
 where node >nul 2>&1
 if errorlevel 1 (
-    echo [启动] ✘ 未找到 Node.js，请先安装 Node.js 22.5+
-    echo [启动]   下载地址：https://nodejs.org/
+    echo [start] ERROR: Node.js not found. Please install Node.js 22.5+
+    echo [start]   Download: https://nodejs.org/
     pause
     exit /b 1
 )
 for /f "tokens=*" %%i in ('node -v') do set NODE_VER=%%i
-echo [启动] Node.js 版本：%NODE_VER%
+echo [start] Node.js version: %NODE_VER%
 
-REM ---- 解析参数 ----
+REM ---- Parse arguments ----
 set MODE=--sim
-if /i "%1"=="live" set MODE=--live
-if /i "%1"=="--live" set MODE=--live
-if /i "%1"=="-l" set MODE=--live
-if /i "%1"=="sim" set MODE=--sim
-if /i "%1"=="--sim" set MODE=--sim
-if /i "%1"=="-s" set MODE=--sim
-if /i "%1"=="--help" goto :showhelp
-if /i "%1"=="-h" goto :showhelp
-if /i "%1"=="/?" goto :showhelp
+set ARG1=%~1
+if /i "%ARG1%"=="live" set MODE=--live
+if /i "%ARG1%"=="--live" set MODE=--live
+if /i "%ARG1%"=="-l" set MODE=--live
+if /i "%ARG1%"=="sim" set MODE=--sim
+if /i "%ARG1%"=="--sim" set MODE=--sim
+if /i "%ARG1%"=="-s" set MODE=--sim
+if /i "%ARG1%"=="--help" goto :showhelp
+if /i "%ARG1%"=="-h" goto :showhelp
+if /i "%ARG1%"=="/?" goto :showhelp
 
-echo [启动] 采集模式：%MODE%
-echo [启动] 正在启动全量服务...
+echo [start] Collector mode: %MODE%
+echo [start] Starting full service...
 echo.
 
-REM ---- 启动 ----
+REM ---- Launch ----
 node scripts/start.js %MODE% %2 %3 %4 %5 %6 %7 %8 %9
 
-REM ---- 异常退出提示 ----
+REM ---- Error handling ----
 if errorlevel 1 (
     echo.
-    echo [启动] ✘ 服务启动失败，请检查上方错误信息
+    echo [start] ERROR: Service failed to start. Check the error above.
     pause
 )
 goto :eof
 
 :showhelp
 echo.
-echo 用法:
-echo   start.bat              模拟采集模式（默认，无需网络）
-echo   start.bat live         真实 DHT + PEX + Tracker 全网络采集
-echo   start.bat sim          模拟采集模式
+echo Usage:
+echo   start.bat              Simulation mode (default, no network needed)
+echo   start.bat live         Real DHT + PEX + Tracker collection
+echo   start.bat sim          Simulation mode
 echo.
-echo 也可直接传递 start.js 参数:
+echo Pass-through start.js options:
 echo   start.bat --live --port 9000 --monitor-port 9090
 echo   start.bat --no-collector --no-monitor
 echo.
-echo 信号:
-echo   Ctrl+C    优雅关闭所有服务后退出
+echo Signal:
+echo   Ctrl+C    Graceful shutdown
 echo.
 pause
 goto :eof
