@@ -16,21 +16,30 @@ const { lookup: dnsLookupRaw } = dns.promises;
 /* ---------- DNS 缓存（5 分钟 TTL，避免健康检查时反复解析同一域名） ---------- */
 const DNS_CACHE = new Map(); // host -> { addrs, expires }
 const DNS_TTL = 300000; // 5 分钟
+const DNS_TIMEOUT = 5000; // DNS 解析超时 5s（v0.8.5：避免 DNS 慢导致延时五位数）
 
 async function dnsLookup(host, opts) {
   const now = Date.now();
   const cached = DNS_CACHE.get(host);
   if (cached && cached.expires > now) return cached.addrs;
-  const addrs = await dnsLookupRaw(host, opts);
+  /* DNS 解析加超时：防止系统 DNS 慢导致健康检查整体超时。
+     用 Promise.race + setTimeout 而非 AbortSignal（Node 22 dns.lookup 不完全支持 abort）。 */
+  const lookupPromise = dnsLookupRaw(host, opts);
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('DNS timeout')), DNS_TIMEOUT)
+  );
+  const addrs = await Promise.race([lookupPromise, timeoutPromise]);
   DNS_CACHE.set(host, { addrs, expires: now + DNS_TTL });
   return addrs;
 }
 
 /* ---------- HTTP keepalive 连接池（复用 TCP 连接，减少握手开销） ---------- */
+/* v0.8.5：agent timeout 从 10s 降至 6s，与健康检查 FAST_TIMEOUT 对齐，
+   避免出现 10000ms+ 的五位数延时（旧值 10s 是五位数延时的直接来源）。 */
 const http = require('http');
 const https = require('https');
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 10000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: 10000 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, timeout: 6000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: 6000 });
 
 /* 全球公共 tracker 种子列表（HTTP + UDP，覆盖各地区）。
    已按 URL 去重：同一主机不同端口/路径/协议视为不同 tracker 端点（它们都是独立的服务实例）。 */
@@ -249,6 +258,102 @@ function scrapeUDPAddr(address, family, port, infohashHex, opts = {}) {
   });
 }
 
+/* UDP 健康检查探针：仅执行 connect 步骤（1 个 RTT），不发送 announce。
+   比完整 announce（2 个 RTT）快一倍，且不占用 tracker 的 announce 配额。
+   如果收到 connect 响应（action=0 + 匹配的 transaction_id），则 tracker 存活。
+   action=3（error）也视为存活——tracker 处理了请求。 */
+function probeUDP(trackerUrl, timeout = 6000) {
+  return new Promise((resolve) => {
+    const m = trackerUrl.match(/^udp:\/\/([^:\/]+):(\d+)/);
+    if (!m) return resolve({ responded: false, error: 'invalid udp url' });
+    const host = m[1];
+    const port = parseInt(m[2], 10);
+    let sock;
+    let timer = null;
+    let done = false;
+
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      try { sock.close(); } catch (_) {}
+      resolve(val);
+    };
+
+    timer = setTimeout(() => finish({ responded: false, error: 'timeout' }), timeout);
+
+    /* DNS 解析（带超时） */
+    dnsLookup(host, { all: true }).then(addresses => {
+      if (!addresses || !addresses.length) return finish({ responded: false, error: 'no dns records' });
+      const addr = addresses[0];
+      const family = addr.family;
+      const sockType = family === 6 ? 'udp6' : 'udp4';
+      try { sock = dgram.createSocket(sockType); }
+      catch (e) { return finish({ responded: false, error: 'socket: ' + String(e && e.message || e) }); }
+
+      sock.on('error', () => finish({ responded: false, error: 'socket error' }));
+
+      const transactionId = crypto.randomBytes(4);
+      const connectReq = Buffer.alloc(16);
+      connectReq.writeBigUInt64BE(UDP_CONNECT_MAGIC, 0);
+      connectReq.writeUInt32BE(0, 8); // action = 0 (connect)
+      connectReq.writeUInt32BE(transactionId.readUInt32BE(0), 12);
+
+      sock.on('message', (msg) => {
+        if (msg.length < 16 || done) return;
+        const action = msg.readUInt32BE(0);
+        const respTid = msg.readUInt32BE(4);
+        if (respTid !== transactionId.readUInt32BE(0)) return;
+        if (action === 0) {
+          // connect 响应 → tracker 存活
+          finish({ responded: true, connectionId: msg.readBigUInt64BE(8) });
+        } else if (action === 3) {
+          // error 响应 → tracker 处理了请求，视为存活
+          finish({ responded: true, error: msg.slice(8).toString() });
+        }
+      });
+
+      sock.send(connectReq, port, addr.address);
+    }).catch(e => finish({ responded: false, error: 'dns: ' + String(e && e.message || e) }));
+  });
+}
+
+/* HTTP 健康检查探针：发送 announce 请求（numwant=0，不请求 peer），检查是否收到 bencode 响应。
+   比 scrapeTracker 更轻量：不解析 peer，只判断是否响应。 */
+async function probeHTTP(trackerUrl, timeout = 6000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    /* numwant=0：不请求 peer 列表，减少 tracker 负载和网络流量 */
+    const url = trackerUrl + '?info_hash=' + encodeURIComponent(Buffer.from(PROBE_INFOHASH, 'hex'))
+      + '&peer_id=' + encodeURIComponent(crypto.randomBytes(20))
+      + '&port=6881&uploaded=0&downloaded=0&left=1&compact=1&numwant=0';
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { 'User-Agent': 'uTorrent/3.5.5', 'Accept': 'application/octet-stream, text/plain, */*' },
+      agent: trackerUrl.startsWith('https:') ? httpsAgent : httpAgent,
+    });
+    const body = Buffer.from(await res.arrayBuffer());
+    let decoded;
+    try { decoded = bencode.decode(body); } catch (_) { decoded = null; }
+    if (!decoded || typeof decoded !== 'object') {
+      return { responded: false, error: 'invalid response' };
+    }
+    // failure reason 也算存活——tracker 正常处理了请求
+    return { responded: true };
+  } catch (e) {
+    return { responded: false, error: String(e && e.message || e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* 健康检查专用探针：自动选择 UDP/HTTP 探针，更快更轻量 */
+async function probeTracker(trackerUrl, timeout = 6000) {
+  if (trackerUrl.startsWith('udp://')) return probeUDP(trackerUrl, timeout);
+  return probeHTTP(trackerUrl, timeout);
+}
+
 /* 解析 host → 并发尝试所有解析地址（IPv4/IPv6），首个成功结果胜出 */
 async function scrapeUDP(trackerUrl, infohashHex, opts = {}) {
   const m = trackerUrl.match(/^udp:\/\/([^:\/]+):(\d+)/);
@@ -266,7 +371,8 @@ async function scrapeUDP(trackerUrl, infohashHex, opts = {}) {
   }
 
   const attempts = addresses.map(a => scrapeUDPAddr(a.address, a.family, port, infohashHex, opts));
-  // 并发竞速：首个拿到 peer 的结果立即返回；其余 socket 各自超时后自关闭
+  /* v0.8.5：并发竞速——首个 responded 的结果立即返回（旧逻辑仅在有 peers 时才 resolve，
+     导致即使 tracker 已响应但 0 peers 时仍等待所有地址超时，产生五位数延时）。 */
   return new Promise((resolve) => {
     let resolved = false;
     let pending = attempts.length;
@@ -274,7 +380,8 @@ async function scrapeUDP(trackerUrl, infohashHex, opts = {}) {
     const pick = (val) => {
       if (resolved) return;
       if (val && !best && (val.peers.length || val.peers6.length || val.responded)) best = val;
-      if (val && (val.peers.length || val.peers6.length)) {
+      /* 任何有响应（有 peers 或 responded）的结果立即返回 */
+      if (val && (val.peers.length || val.peers6.length || val.responded)) {
         resolved = true;
         resolve(val);
         return;
@@ -605,11 +712,19 @@ class TrackerManager {
           const info = targets[idx++];
           const t0 = Date.now();
           try {
-            const r = await scrapeTracker(info.url, PROBE_INFOHASH, { numwant: 1, timeout });
+            /* v0.8.5：使用专用探针 probeTracker 代替 scrapeTracker。
+               - UDP：仅 connect 步骤（1 RTT），不发 announce，快一倍且不占配额
+               - HTTP：numwant=0，不请求 peer 列表，更轻量
+               修复了五位数延时 + 误判死亡的 P0 问题：
+               1. 旧 scrapeTracker 做 full announce（2 RTT for UDP），耗时翻倍
+               2. 旧 UDP racing 仅在有 peers 时 resolve，0-peers 响应要等所有地址超时
+               3. 旧 agent timeout=10s 导致延时可达 10000ms（五位数） */
+            const r = await probeTracker(info.url, timeout);
             info.lastCheck = Date.now();
             if (r && r.responded) {
               info.alive = true;
-              info.latency = info.lastCheck - t0;
+              /* v0.8.5：latency 封顶为 timeout，防止 DNS 慢或异常情况产生五位数延时 */
+              info.latency = Math.min(info.lastCheck - t0, timeout);
               info.fails = 0;
               this._healthProgress.alive++;
             } else {
@@ -618,12 +733,14 @@ class TrackerManager {
               // dead tracker 仍会由全量复查定期重试（每 3 轮 1 次），恢复后自动转回 alive。
               info.fails = (info.fails || 0) + 1;
               info.alive = false;
+              info.latency = 0;
               this._healthProgress.dead++;
             }
           } catch (_) {
             info.lastCheck = Date.now();
             info.fails = (info.fails || 0) + 1;
             info.alive = false;
+            info.latency = 0;
             this._healthProgress.dead++;
           }
           this._healthProgress.checked++;
@@ -767,6 +884,93 @@ class TrackerManager {
     const key = String(url).trim().toLowerCase();
     return this.trackers.delete(key);
   }
+
+  /* 手动检查指定 tracker（单个或批量）。
+     返回每个 tracker 的检查结果 { url, alive, latency, error } */
+  async checkTrackers(urls, timeout = 6000) {
+    const list = typeof urls === 'string' ? [urls] : Array.isArray(urls) ? urls : [];
+    const results = [];
+    // 并发检查，但限制并发数避免 fd 耗尽
+    const CONCURRENCY = 20;
+    let idx = 0;
+    const worker = async () => {
+      while (idx < list.length) {
+        const url = list[idx++];
+        const key = url.trim().toLowerCase();
+        const info = this.trackers.get(key);
+        const t0 = Date.now();
+        try {
+          const r = await probeTracker(url, timeout);
+          const latency = Math.min(Date.now() - t0, timeout);
+          const alive = !!(r && r.responded);
+          if (info) {
+            info.alive = alive;
+            info.latency = alive ? latency : 0;
+            info.lastCheck = Date.now();
+            if (alive) info.fails = 0;
+            else info.fails = (info.fails || 0) + 1;
+          }
+          results.push({ url, alive, latency, error: r && r.error && !alive ? r.error : null });
+        } catch (e) {
+          if (info) {
+            info.alive = false;
+            info.fails = (info.fails || 0) + 1;
+            info.lastCheck = Date.now();
+            info.latency = 0;
+          }
+          results.push({ url, alive: false, latency: 0, error: String(e && e.message || e) });
+        }
+      }
+    };
+    const workers = [];
+    for (let i = 0; i < Math.min(CONCURRENCY, list.length); i++) workers.push(worker());
+    await Promise.allSettled(workers);
+    return results;
+  }
+
+  /* 从用户指定的 URL 拉取 tracker 列表并添加到池中。
+     支持：纯文本列表（每行一个 URL）、HTML 页面（正则提取 tracker URL）。
+     返回 { fetched, added, duplicates, errors } */
+  async fetchFromUrl(srcUrl, opts = {}) {
+    const timeout = opts.timeout || 15000;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    let text = '';
+    try {
+      const res = await fetch(srcUrl, {
+        signal: ctrl.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ikwyd-tracker-fetch/2.0)' },
+      });
+      clearTimeout(timer);
+      if (!res.ok) return { fetched: 0, added: 0, duplicates: 0, errors: ['HTTP ' + res.status] };
+      text = await res.text();
+    } catch (e) {
+      clearTimeout(timer);
+      return { fetched: 0, added: 0, duplicates: 0, errors: [String(e && e.message || e)] };
+    }
+
+    // 判断是纯文本列表还是 HTML 页面
+    let candidates;
+    if (/<html|<!doctype/i.test(text) || HTML_SOURCE_RE.test(srcUrl)) {
+      candidates = [...extractTrackersFromText(text)];
+    } else {
+      candidates = text.split(/\r?\n/).map(s => s.trim())
+        .filter(s => /^(udp|https?):\/\//i.test(s));
+    }
+
+    const result = { fetched: candidates.length, added: 0, duplicates: 0, errors: [] };
+    const newUrls = [];
+    for (const u of candidates) {
+      if (this._add(u)) { result.added++; newUrls.push(u); }
+      else result.duplicates++;
+      if (this.trackers.size >= this.maxTrackers) break;
+    }
+    // 立即对新添加的 tracker 触发增量健康检查
+    if (newUrls.length && this.started) {
+      this.healthCheck({ fast: true, onlyUnchecked: true }).catch(() => {});
+    }
+    return result;
+  }
 }
 
 /* 模块级默认管理器实例；调用 trackerManager.start() 后 harvest 优先使用其存活列表 */
@@ -817,6 +1021,9 @@ module.exports = {
   scrapeTracker,
   scrapeHTTP,
   scrapeUDP,
+  probeTracker,
+  probeUDP,
+  probeHTTP,
   harvest,
   parseCompactPeers,
   parseCompactPeers6,

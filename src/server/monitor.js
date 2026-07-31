@@ -328,6 +328,31 @@ async function handle(req, res) {
     const ok = collectorRef.trackerMgr.removeTracker(url);
     return json(res, 200, { removed: ok });
   }
+  // 手动检查指定 tracker 健康状态（POST /api/trackers/check，body: { urls: "url1\nurl2" | ["url1","url2"] }）
+  if (pathname === '/api/trackers/check' && req.method === 'POST') {
+    if (!collectorRef || !collectorRef.trackerMgr) return json(res, 503, { error: 'tracker manager not running' });
+    const body = await readBody(req);
+    let urls;
+    try { urls = JSON.parse(body).urls; } catch (_) { urls = body; }
+    if (typeof urls === 'string') urls = urls.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean);
+    if (!Array.isArray(urls) || !urls.length) return json(res, 400, { error: 'urls required' });
+    try {
+      const results = await collectorRef.trackerMgr.checkTrackers(urls);
+      return json(res, 200, { results });
+    } catch (e) { return json(res, 500, { error: e.message }); }
+  }
+  // 从 URL 拉取 tracker 列表并添加（POST /api/trackers/fetch-url，body: { url: "https://..." }）
+  if (pathname === '/api/trackers/fetch-url' && req.method === 'POST') {
+    if (!collectorRef || !collectorRef.trackerMgr) return json(res, 503, { error: 'tracker manager not running' });
+    const body = await readBody(req);
+    let srcUrl = '';
+    try { srcUrl = JSON.parse(body).url || ''; } catch (_) { srcUrl = body; }
+    if (!srcUrl || !/^https?:\/\//i.test(srcUrl)) return json(res, 400, { error: 'valid url required' });
+    try {
+      const result = await collectorRef.trackerMgr.fetchFromUrl(srcUrl);
+      return json(res, 200, result);
+    } catch (e) { return json(res, 500, { error: e.message }); }
+  }
   if (pathname === '/api/nodes') {
     if (!collectorRef) return json(res, 503, { error: 'collector not initialized' });
     return json(res, 200, collectorRef.getNodes());

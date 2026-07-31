@@ -171,6 +171,57 @@ const App = {
         }).catch(d => { addResult.value = d && d.error ? d : { error: (d && d.message) || '请求失败' }; });
     }
 
+    /* 手动检查单个 tracker */
+    const checkingUrls = ref({});
+    function checkOneTracker(url) {
+      checkingUrls.value[url] = true;
+      fetch('/api/trackers/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls: [url] }) })
+        .then(r => r.ok ? r.json() : null).then(d => {
+          if (d && d.results && d.results[0]) {
+            const r = d.results[0];
+            /* 直接更新本地列表，无需等待刷新 */
+            const item = trkList.value.find(t => t.url === url);
+            if (item) {
+              item.alive = r.alive;
+              item.latency = r.latency;
+              item.lastCheck = Date.now();
+            }
+          }
+        }).catch(()=>{}).finally(() => { delete checkingUrls.value[url]; });
+    }
+
+    /* 批量检查当前过滤后的 tracker */
+    const batchCheckResult = ref(null);
+    function checkFilteredTrackers() {
+      const urls = filteredTrackers.value.map(t => t.url);
+      if (!urls.length) return;
+      batchCheckResult.value = { loading: true, total: urls.length };
+      fetch('/api/trackers/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ urls: urls }) })
+        .then(r => r.ok ? r.json() : null).then(d => {
+          if (d && d.results) {
+            const alive = d.results.filter(r => r.alive).length;
+            batchCheckResult.value = { done: true, total: d.results.length, alive, dead: d.results.length - alive };
+            setTimeout(() => { refreshTrackers(); batchCheckResult.value = null; }, 3000);
+          }
+        }).catch(()=>{ batchCheckResult.value = null; });
+    }
+
+    /* 从 URL 拉取 tracker 列表 */
+    const showFetchUrlModal = ref(false);
+    const fetchUrlInput = ref('');
+    const fetchUrlResult = ref(null);
+    function openFetchUrlModal() { showFetchUrlModal.value = true; fetchUrlResult.value = null; }
+    function closeFetchUrlModal() { showFetchUrlModal.value = false; }
+    function submitFetchUrl() {
+      if (!fetchUrlInput.value.trim()) return;
+      fetchUrlResult.value = { loading: true };
+      fetch('/api/trackers/fetch-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: fetchUrlInput.value }) })
+        .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d))).then(d => {
+          fetchUrlResult.value = d;
+          if (d.added > 0) setTimeout(() => { refreshTrackers(); showFetchUrlModal.value = false; fetchUrlInput.value = ''; fetchUrlResult.value = null; }, 2500);
+        }).catch(d => { fetchUrlResult.value = d && d.error ? d : { error: (d && d.message) || '请求失败' }; });
+    }
+
     /* 采集器控制 */
     function ctlCollector(action) {
       fetch('/api/collector', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) })
@@ -211,10 +262,12 @@ const App = {
     });
 
     return { stats, charts, trkList, trkFilter, curMins, nodes, showAddModal, trkInput, addResult, memHistory,
+      checkingUrls, batchCheckResult, showFetchUrlModal, fetchUrlInput, fetchUrlResult,
       healthClass, healthText, filteredTrackers, trkAliveCount, srcTotal, ccTotal, sizeRate, v2Rate, coldRate, trkRate,
       TIME_WINDOWS, TIME_LABELS, SRC_DEFS,
       fmt, fmtMB, fmtSize, fmtTime, fmtAgo, fmtDur, esc, srcDef, srcPct, ccPct, ccColor,
-      setMins, submitAddTrackers, openAddModal, closeAddModal, ctlCollector };
+      setMins, submitAddTrackers, openAddModal, closeAddModal, ctlCollector,
+      checkOneTracker, checkFilteredTrackers, openFetchUrlModal, closeFetchUrlModal, submitFetchUrl };
   },
   template: '<div class="fade-in">' +
     '<div style="background:linear-gradient(135deg,#161d27 0%,#0f1419 100%);border-bottom:2px solid #238636;padding:12px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 2px 12px rgba(0,0,0,0.5)">' +
@@ -255,7 +308,7 @@ const App = {
         '<div class="card"><div class="card-title"><span>Tracker 健康度</span><span style="color:#3fb950;font-weight:600">{{ fmt(stats.tracker ? stats.tracker.alive : 0) }}/{{ fmt(stats.tracker ? stats.tracker.total : 0) }}</span></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><div class="mini-stat"><div class="l">总 tracker</div><div class="v">{{ fmt(stats.tracker ? stats.tracker.total : 0) }}</div></div><div class="mini-stat"><div class="l">存活</div><div class="v" style="color:#3fb950">{{ fmt(stats.tracker ? stats.tracker.alive : 0) }}</div></div><div class="mini-stat"><div class="l">死亡/未检</div><div class="v" style="color:#f85149">{{ fmt(stats.tracker ? stats.tracker.dead : 0) }}/{{ fmt(stats.tracker ? stats.tracker.unchecked : 0) }}</div></div><div class="mini-stat"><div class="l">平均延迟</div><div class="v">{{ stats.tracker ? (stats.tracker.avgLatency||0) : 0 }}ms</div></div></div><div style="margin-top:8px;font-size:10px;color:#54626f;display:flex;justify-content:space-between"><span>存活率</span><span style="color:#3fb950">{{ trkRate.toFixed(1) }}%</span></div><div style="width:100%;height:5px;background:#232c38;border-radius:3px;overflow:hidden;margin-top:6px"><div style="height:100%;background:linear-gradient(90deg,#238636,#3fb950);transition:width 0.6s" :style="{ width: (trkRate > 0 && trkRate < 1 ? 1 : Math.min(100, trkRate)) + \'%\' }"></div></div><div style="margin-top:6px;font-size:11px;color:#54626f">{{ stats.tracker ? (stats.tracker.checking ? (\'健康检查中 \' + (stats.tracker.healthProgress ? fmt(stats.tracker.healthProgress.checked) + \'/\' + fmt(stats.tracker.healthProgress.total) + \' (\' + stats.tracker.healthProgress.pct + \'%)\' : \'…\')) : (\'共 \' + fmt(stats.tracker.sources||0) + \' 个列表源 · 存活 \' + fmt(stats.tracker.alive||0))) : \'详情见下方列表\' }}</div></div>' +
       '</div>' +
       '<div class="grid-2-1" style="display:grid;gap:12px;margin-top:12px">' +
-        '<div class="card"><div class="card-title"><span>Tracker 详情（全量 · 存活在前 · 滚动查看）</span><span style="display:flex;align-items:center;gap:4px"><input v-model="trkFilter" placeholder="过滤 URL…" style="width:180px;background:#0f1419;border:1px solid #232c38;border-radius:4px;color:#c9d1d9;padding:3px 8px;font-size:11px;outline:none"><button @click="openAddModal" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:12px;margin-left:4px">+ 添加 Tracker</button><span style="color:#54626f;margin-left:8px">共 {{ fmt(trkList.length) }} 条 · 存活 {{ fmt(trkAliveCount) }}{{ trkFilter ? \' · 过滤 \' + filteredTrackers.length : \'\' }}</span></span></div><div style="max-height:420px;overflow-y:auto"><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th>Tracker URL</th><th>状态</th><th>延迟</th><th>失败</th><th>最近检查</th></tr></thead><tbody><tr v-if="!filteredTrackers.length"><td colspan="5" style="color:#54626f;text-align:center;padding:20px;font-size:12px">{{ trkList.length ? \'无匹配\' : \'未启动 TrackerManager\' }}</td></tr><tr v-for="t in filteredTrackers" :key="t.url"><td style="padding:4px 8px;border-bottom:1px solid #1a2230;color:#c3ccd6;font-family:Consolas,monospace;font-size:11px;word-break:break-all">{{ esc(t.url) }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;white-space:nowrap"><span v-if="t.alive===true" style="color:#3fb950">● 存活</span><span v-else-if="t.alive===false" style="color:#f85149">● 死亡</span><span v-else style="color:#7d8a99">○ 未检</span></td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;font-family:Consolas,monospace;font-size:11px">{{ t.latency > 0 ? t.latency + \'ms\' : \'—\' }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;font-family:Consolas,monospace;font-size:11px">{{ t.fails||0 }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;font-family:Consolas,monospace;font-size:11px">{{ fmtAgo(t.lastCheck) }}</td></tr></tbody></table></div></div>' +
+        '<div class="card"><div class="card-title"><span>Tracker 详情（全量 · 存活在前 · 滚动查看）</span><span style="display:flex;align-items:center;gap:4px;flex-wrap:wrap"><input v-model="trkFilter" placeholder="过滤 URL…" style="width:160px;background:#0f1419;border:1px solid #232c38;border-radius:4px;color:#c9d1d9;padding:3px 8px;font-size:11px;outline:none"><button @click="checkFilteredTrackers" :disabled="batchCheckResult && batchCheckResult.loading" style="background:#1f6feb;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:11px;margin-left:4px" title="检查当前列表中所有 tracker">⚡ 检查全部</button><button @click="openFetchUrlModal" style="background:#8957e5;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:11px" title="从 URL 拉取 tracker 列表">📥 拉取列表</button><button @click="openAddModal" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:11px">+ 添加</button><span style="color:#54626f;margin-left:4px">共 {{ fmt(trkList.length) }} 条 · 存活 {{ fmt(trkAliveCount) }}{{ trkFilter ? \' · 过滤 \' + filteredTrackers.length : \'\' }}</span><span v-if="batchCheckResult && batchCheckResult.loading" style="color:#58a6ff;font-size:10px;margin-left:4px">检查中…</span><span v-if="batchCheckResult && batchCheckResult.done" style="color:#3fb950;font-size:10px;margin-left:4px">✓ 存活 {{ batchCheckResult.alive }} / 死亡 {{ batchCheckResult.dead }}</span></span></div><div style="max-height:420px;overflow-y:auto"><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th>Tracker URL</th><th>状态</th><th>延迟</th><th>失败</th><th>最近检查</th><th>操作</th></tr></thead><tbody><tr v-if="!filteredTrackers.length"><td colspan="6" style="color:#54626f;text-align:center;padding:20px;font-size:12px">{{ trkList.length ? \'无匹配\' : \'未启动 TrackerManager\' }}</td></tr><tr v-for="t in filteredTrackers" :key="t.url"><td style="padding:4px 8px;border-bottom:1px solid #1a2230;color:#c3ccd6;font-family:Consolas,monospace;font-size:11px;word-break:break-all">{{ esc(t.url) }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;white-space:nowrap"><span v-if="t.alive===true" style="color:#3fb950">● 存活</span><span v-else-if="t.alive===false" style="color:#f85149">● 死亡</span><span v-else style="color:#7d8a99">○ 未检</span></td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;font-family:Consolas,monospace;font-size:11px">{{ t.latency > 0 ? t.latency + \'ms\' : \'—\' }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;font-family:Consolas,monospace;font-size:11px">{{ t.fails||0 }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;font-family:Consolas,monospace;font-size:11px">{{ fmtAgo(t.lastCheck) }}</td><td style="padding:4px 8px;border-bottom:1px solid #1a2230;white-space:nowrap"><button @click="checkOneTracker(t.url)" :disabled="checkingUrls[t.url]" style="background:#21262d;color:#58a6ff;border:1px solid #30363d;border-radius:3px;padding:2px 6px;cursor:pointer;font-size:11px" title="检查此 tracker">{{ checkingUrls[t.url] ? \'…\' : \'⚡\' }}</button></td></tr></tbody></table></div></div>' +
         '<div class="card"><div class="card-title">采集器综合统计</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><div class="mini-stat"><div class="l">会话累计</div><div class="v">{{ fmt(stats.counters.ingested||0) }}</div></div><div class="mini-stat"><div class="l">本次新增</div><div class="v">{{ fmt(stats.counters.newTorrents||0) }}</div></div><div class="mini-stat"><div class="l">DHT announce</div><div class="v">{{ fmt(stats.dht.announces||0) }}</div></div><div class="mini-stat"><div class="l">DHT sample</div><div class="v">{{ fmt(stats.dht.samples||0) }}</div></div></div><div style="margin-top:8px"><div style="font-size:10px;color:#54626f">DHT 集群端口</div><div style="font-size:11px;color:#7d8a99;margin-top:2px;font-family:Consolas,monospace">{{ stats.dht.running ? (\'UDP \' + (stats.dht.ports||[]).join(\' / \')) : \'—\' }}</div></div></div>' +
       '</div>' +
       '<div class="grid-events" style="display:grid;gap:12px;margin-top:12px">' +
@@ -266,6 +319,7 @@ const App = {
     '</div>' +
     '<div style="text-align:center;padding:14px;color:#54626f;font-size:11px">BITTORRENTS Network Monitor · DHT 集群 + PEX + Tracker + 爬虫聚合 + WebSeed 全网络接入 · 分步加载 · 平滑过渡</div>' +
     '<div v-if="showAddModal" @click.self="closeAddModal" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center"><div style="background:#1c2331;border:1px solid #30363d;border-radius:8px;padding:20px;width:560px;max-width:90vw"><div style="color:#c9d1d9;font-size:15px;font-weight:600;margin-bottom:10px">手动添加 Tracker</div><div style="color:#7d8a99;font-size:11px;margin-bottom:8px">输入一个或多个 tracker URL（每行一个，或用逗号/空格分隔）。支持 udp:// 和 http(s):// 协议。重复的自动忽略。</div><textarea v-model="trkInput" style="width:100%;height:140px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:8px;font-family:monospace;font-size:12px;resize:vertical" placeholder="udp://tracker.example.com:6969/announce"></textarea><div v-if="addResult" style="margin-top:8px;font-size:12px"><div v-if="addResult.loading" style="color:#7d8a99">正在添加并触发健康检查…</div><div v-else-if="addResult.added !== undefined" style="color:#3fb950">✓ 添加 {{ addResult.added }} 个<span v-if="addResult.duplicates > 0">，重复 {{ addResult.duplicates }} 个</span><span v-if="addResult.errors && addResult.errors.length">，错误 {{ addResult.errors.length }} 个</span></div><div v-else-if="addResult.error" style="color:#f85149">添加失败: {{ addResult.error }}</div></div><div style="margin-top:12px;text-align:right"><button @click="closeAddModal" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 16px;cursor:pointer;margin-right:8px">取消</button><button @click="submitAddTrackers" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:6px 16px;cursor:pointer">添加并检查</button></div></div></div>' +
+    '<div v-if="showFetchUrlModal" @click.self="closeFetchUrlModal" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center"><div style="background:#1c2331;border:1px solid #30363d;border-radius:8px;padding:20px;width:560px;max-width:90vw"><div style="color:#c9d1d9;font-size:15px;font-weight:600;margin-bottom:10px">从 URL 拉取 Tracker 列表</div><div style="color:#7d8a99;font-size:11px;margin-bottom:8px">输入一个返回 tracker 列表的 URL（纯文本每行一个，或 HTML 页面自动提取）。系统将自动拉取、解析并添加到 tracker 池中，随后触发健康检查。</div><input v-model="fetchUrlInput" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:8px;font-family:monospace;font-size:12px" placeholder="https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt"><div style="color:#54626f;font-size:10px;margin-top:6px">常用列表源：<span style="cursor:pointer;color:#58a6ff;text-decoration:underline" @click="fetchUrlInput = \'https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt\'">ngosang/all</span> · <span style="cursor:pointer;color:#58a6ff;text-decoration:underline" @click="fetchUrlInput = \'https://newtrackon.com/api/all\'">newTrackon</span> · <span style="cursor:pointer;color:#58a6ff;text-decoration:underline" @click="fetchUrlInput = \'https://cf.trackerslist.com/all.txt\'">trackerslist.com</span></div><div v-if="fetchUrlResult" style="margin-top:8px;font-size:12px"><div v-if="fetchUrlResult.loading" style="color:#7d8a99">正在拉取并添加…</div><div v-else-if="fetchUrlResult.added !== undefined" style="color:#3fb950">✓ 获取 {{ fetchUrlResult.fetched }} 个，添加 {{ fetchUrlResult.added }} 个<span v-if="fetchUrlResult.duplicates > 0">，重复 {{ fetchUrlResult.duplicates }} 个</span></div><div v-else-if="fetchUrlResult.error" style="color:#f85149">失败: {{ fetchUrlResult.error }}</div></div><div style="margin-top:12px;text-align:right"><button @click="closeFetchUrlModal" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:6px 16px;cursor:pointer;margin-right:8px">取消</button><button @click="submitFetchUrl" style="background:#8957e5;color:#fff;border:none;border-radius:4px;padding:6px 16px;cursor:pointer">拉取并添加</button></div></div></div>' +
   '</div>'
 };
 

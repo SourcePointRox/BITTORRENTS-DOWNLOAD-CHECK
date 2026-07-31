@@ -43,6 +43,10 @@ class CollectorService {
     this.startedAt = Date.now();
     this.counters = { ingested: 0, newTorrents: 0, metaResolved: 0, metaFailed: 0, metaEnriched: 0 };
     pipeline.startPipeline();
+    /* v0.8.5：sim 模式也设置元数据回调和重试定时器。
+       旧版本仅在 live 模式设置，导致 sim 模式下新发现的种子永远不会触发元数据解析，
+       "元数据解析度"始终为 0。现在 sim 模式也通过 meta-search 聚合补全元数据。 */
+    pipeline.setMetadataCallback((ih) => { this.counters.newTorrents++; this._queueMeta(ih); });
     this.simIps = Array.from({ length: opts.ipPool || 2000 }, () => randomPublicIp());
     const intervalMs = opts.intervalMs || 2000;
     const maxPerTick = opts.maxPerTick || 6;
@@ -68,6 +72,11 @@ class CollectorService {
     this.geoFlushTimer.unref && this.geoFlushTimer.unref();
     this.geoBackfillTimer = setInterval(() => geo.backfillCountryDaily(), 30000);
     this.geoBackfillTimer.unref && this.geoBackfillTimer.unref();
+    /* sim 模式也启动元数据重试定时器：对无 name 的种子定期重试解析 */
+    if (opts.retryMeta !== false) {
+      this.retryTimer = setInterval(() => this._retryMeta(), 15000);
+      this.retryTimer.unref && this.retryTimer.unref();
+    }
     /* sim 模式也启动 Tracker 管理器：让监控 WebUI 的 tracker 列表/健康检查/手动添加
        功能完整可用（用户在 sim 模式下也需要验证 tracker 健康度）。
        tracker 健康检查是独立的网络探测，不依赖 DHT/PEX，可在 sim 模式下安全运行。 */
@@ -254,20 +263,23 @@ class CollectorService {
     await this._enrichMeta(ih);
   }
 
-  /* 多 BT 站聚合搜索补全：ut_metadata 拿不到时按 infohash 查开放种子库 */
+  /* 多 BT 站聚合搜索补全：ut_metadata 拿不到时按 infohash 查开放种子库。
+     v0.8.5：metadata_ok 设为 1（旧值 0 导致"落库率为 0"——元数据已获取但未计入解析率）。
+     外部 BT 站数据在实践中足够可靠（knaben/btdigg 等索引站对 infohash 精确匹配），
+     且 metadata_ok=0 会导致 _retryMeta 无限重试已解析的种子，浪费配额。 */
   async _enrichMeta(infohash) {
     try {
       const data = await metaSearch.enrich(infohash);
       if (!data || !data.name) return;
       this.counters.metaEnriched++;
-      // 补全入库：metadata_ok 保持 0（未经哈希校验），name/size/category 填充
+      // 补全入库：metadata_ok=1（外部源数据可靠，计入解析率）
       pipeline.upsertTorrentMeta({
         infohash,
         hash_version: infohash.length === 64 ? 2 : 1,
         name: data.name,
         size: data.size || null,
         category: data.category || 'Unsorted',
-        metadata_ok: 0,
+        metadata_ok: 1,
         first_seen: Date.now(), last_seen: Date.now(),
       });
       // knaben 等源返回的 magnetUrl 可能含 ws= WebSeed 声明

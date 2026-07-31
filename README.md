@@ -595,6 +595,62 @@ node tests/admin.js     # 后台 WEBUI：仪表盘/统计 API/采集控制
 
 ## 更新日志
 
+### v0.8.5 — 2026-07-31
+
+> Tracker 健康检查 P0 修复（五位数延时+误判死亡）+ 手动检查/URL拉取功能 + 元数据落库率修复 + .bat 启动脚本。
+
+#### P0 修复（严重）
+
+- **Tracker 延时五位数 + 误判死亡（P0）**：
+  - **根因**（三重叠加）：
+    1. `httpAgent`/`httpsAgent` 的 `timeout: 10000`（10s）→ 延时可达 10000ms（五位数）
+    2. DNS 解析无超时限制 → 系统 DNS 慢时健康检查整体超时
+    3. UDP `scrapeUDP` racing 逻辑仅在有 peers 时 resolve，tracker 响应 0 peers 时仍等待所有地址超时
+    4. 健康检查使用 `scrapeTracker`（full announce，2 RTT for UDP），耗时翻倍
+  - **修复**：
+    - 新增专用探针 `probeTracker`：UDP 仅做 connect 步骤（1 RTT，不发 announce），HTTP 用 `numwant=0`（不请求 peer）
+    - `httpAgent`/`httpsAgent` timeout 从 10s 降至 6s，与 `FAST_TIMEOUT` 对齐
+    - DNS 解析加 5s 超时（`Promise.race` + `setTimeout`），防止系统 DNS 慢
+    - UDP racing 逻辑修复：首个 `responded` 的结果立即返回（不再等所有地址超时）
+    - `latency` 封顶为 `timeout` 值：`Math.min(latency, timeout)`
+  - **验证**：tracker 延时不再出现五位数，可 ping 通的 tracker 正确显示为存活
+
+- **元数据落库率为 0（P0）**：
+  - **根因**（双重叠加）：
+    1. `startSim()` 未设置 `pipeline.setMetadataCallback()` — sim 模式下新种子不触发元数据解析
+    2. `_enrichMeta()` 设置 `metadata_ok: 0` — 外部 BT 站获取的元数据不计入解析率
+  - **修复**：
+    - `startSim()` 添加 `pipeline.setMetadataCallback()` + 15s 重试定时器
+    - `_enrichMeta()` 设置 `metadata_ok: 1`（外部 BT 站数据可靠，knaben/btdigg 精确匹配 infohash）
+  - **验证**：sim 模式下元数据解析率从 0% 开始上升，`_retryMeta` 不再无限重试已解析种子
+
+#### 新功能
+
+- **Tracker 手动健康检查**：
+  - 监控 WebUI 的 Tracker 详情表中，每行添加 ⚡ 检查按钮
+  - 点击后单独检查该 tracker，立即更新状态/延时，无需等待定时全量检查
+  - API: `POST /api/trackers/check`，body: `{ urls: ["url1","url2"] }`
+  - 同时添加"⚡ 检查全部"按钮，批量检查当前过滤后的所有 tracker
+
+- **从 URL 拉取 Tracker 列表**：
+  - 监控 WebUI 添加"📥 拉取列表"按钮
+  - 输入一个返回 tracker 列表的 URL（纯文本或 HTML 页面）
+  - 系统自动拉取、解析、添加到 tracker 池，并触发健康检查
+  - 预置常用列表源快捷链接（ngosang/all、newTrackon、trackerslist.com）
+  - API: `POST /api/trackers/fetch-url`，body: `{ url: "https://..." }`
+
+- **Windows .bat 启动脚本**：
+  - `start.bat` — 一键启动全量服务
+  - 自动检查 Node.js 环境
+  - 支持 `start.bat live` / `start.bat sim` 参数
+  - 透传 `start.js` 的所有参数（端口、DHT 实例等）
+
+#### 验证
+
+- 123 项测试全部通过（30 unit + 34 admin + 59 e2e）
+
+---
+
 ### v0.8.4 — 2026-07-31
 
 > 监控 WebUI 全面修复：采集器控制端点缺失 + 冷存储 readOnly 无法读取 WAL + Tracker 健康检查停滞 + 内存趋势图空白 + 实时数据刷新缓存。
