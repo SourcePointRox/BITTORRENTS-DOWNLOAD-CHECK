@@ -222,17 +222,28 @@ const App = {
         }).catch(d => { fetchUrlResult.value = d && d.error ? d : { error: (d && d.message) || '请求失败' }; });
     }
 
-    /* 采集器控制 */
-    function ctlCollector(action) {
+    /* 采集器控制：快捷模式切换 OFF / SIM / LIVE */
+    const collectorSwitching = ref(false);
+    function ctlCollector(targetMode) {
+      /* targetMode: 'off' | 'sim' | 'live' | 'stop'
+         - off/stop: 停止采集器
+         - sim: 启动模拟采集
+         - live: 启动真实 DHT 采集 */
+      if (collectorSwitching.value) return;
+      const action = (targetMode === 'off' || targetMode === 'stop') ? 'stop'
+        : (targetMode === 'sim') ? 'start-sim'
+        : 'start-live';
+      collectorSwitching.value = true;
       fetch('/api/collector', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) })
-        .then(r => r.ok ? r.json() : null).then(d => {
+        .then(r => r.ok ? r.json() : r.json().then(d => Promise.reject(d))).then(d => {
+          if (d && d.error) { console.error('[collector]', d.error); return; }
           if (d) {
-            if (d.error) { console.error('[collector]', d.error); return; }
             applyStats(d);
             refreshTrackers();
             setTimeout(refreshNodes, 500);
           }
-        }).catch(e => { console.error('[collector]', e.message); });
+        }).catch(e => { console.error('[collector]', (e && e.message) || e); })
+        .finally(() => { setTimeout(() => { collectorSwitching.value = false; }, 600); });
     }
 
     /* 轮询 */
@@ -262,7 +273,7 @@ const App = {
     });
 
     return { stats, charts, trkList, trkFilter, curMins, nodes, showAddModal, trkInput, addResult, memHistory,
-      checkingUrls, batchCheckResult, showFetchUrlModal, fetchUrlInput, fetchUrlResult,
+      checkingUrls, batchCheckResult, showFetchUrlModal, fetchUrlInput, fetchUrlResult, collectorSwitching,
       healthClass, healthText, filteredTrackers, trkAliveCount, srcTotal, ccTotal, sizeRate, v2Rate, coldRate, trkRate,
       TIME_WINDOWS, TIME_LABELS, SRC_DEFS,
       fmt, fmtMB, fmtSize, fmtTime, fmtAgo, fmtDur, esc, srcDef, srcPct, ccPct, ccColor,
@@ -274,12 +285,15 @@ const App = {
       '<h1 style="font-size:18px;color:#58a6ff;display:flex;align-items:center;gap:10px"><span style="width:26px;height:26px;background:linear-gradient(135deg,#238636,#2ea043);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;box-shadow:0 0 10px rgba(35,134,54,0.6)">B</span>BITTORRENTS 网络监控中心</h1>' +
       '<div style="display:flex;gap:14px;align-items:center;font-size:12px"><span :class="\'health-badge \' + healthClass" style="padding:3px 12px;border-radius:16px;font-weight:600;font-size:11px">{{ healthText }}</span><span style="color:#7d8a99">{{ stats.mode === \'off\' ? \'—\' : \'运行 \' + fmtDur(stats.uptimeSec) }}</span><a :href="\'http://localhost:\' + (stats.sitePort||8080) + \'/\'" target="_blank" style="font-size:11px;color:#58a6ff">主站点 →</a></div>' +
     '</div>' +
-    '<div style="background:#0d1117;border-bottom:1px solid #232c38;padding:6px 24px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-      '<span style="font-size:11px;color:#7d8a99;margin-right:8px">采集控制:</span>' +
-      '<button @click="ctlCollector(\'start-sim\')" style="background:#238636;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:11px">启动模拟采集</button>' +
-      '<button @click="ctlCollector(\'start-live\')" style="background:#d29922;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:11px">启动真实DHT采集</button>' +
-      '<button @click="ctlCollector(\'stop\')" style="background:#da3633;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:11px">停止采集</button>' +
-      '<span style="font-size:10px;color:#54626f;margin-left:8px">当前模式: {{ stats.mode.toUpperCase() }}</span>' +
+    '<div style="background:#0d1117;border-bottom:1px solid #232c38;padding:6px 24px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+      '<span style="font-size:11px;color:#7d8a99;margin-right:4px">采集模式:</span>' +
+      '<div style="display:inline-flex;background:#161d27;border:1px solid #232c38;border-radius:6px;overflow:hidden">' +
+        '<button @click="ctlCollector(\'off\')" :disabled="collectorSwitching || stats.mode===\'off\'" :style="\'padding:5px 16px;border:none;cursor:pointer;font-size:11px;font-weight:600;transition:all .2s;\' + (stats.mode===\'off\' ? \'background:#da3633;color:#fff\' : \'background:transparent;color:#8b949e\') + (collectorSwitching ? \';opacity:.5;cursor:not-allowed\' : \'\')" title="停止所有采集">{{ collectorSwitching && stats.mode!==\'off\' ? \'…\' : \'OFF\' }}</button>' +
+        '<button @click="ctlCollector(\'sim\')" :disabled="collectorSwitching || stats.mode===\'sim\'" :style="\'padding:5px 16px;border:none;border-left:1px solid #232c38;cursor:pointer;font-size:11px;font-weight:600;transition:all .2s;\' + (stats.mode===\'sim\' ? \'background:#238636;color:#fff\' : \'background:transparent;color:#8b949e\') + (collectorSwitching ? \';opacity:.5;cursor:not-allowed\' : \'\')" title="模拟采集模式（无需网络）">{{ collectorSwitching && stats.mode!==\'sim\' ? \'…\' : \'SIM\' }}</button>' +
+        '<button @click="ctlCollector(\'live\')" :disabled="collectorSwitching || stats.mode===\'live\'" :style="\'padding:5px 16px;border:none;border-left:1px solid #232c38;cursor:pointer;font-size:11px;font-weight:600;transition:all .2s;\' + (stats.mode===\'live\' ? \'background:#d29922;color:#fff\' : \'background:transparent;color:#8b949e\') + (collectorSwitching ? \';opacity:.5;cursor:not-allowed\' : \'\')" title="真实 DHT+PEX+Tracker 采集">{{ collectorSwitching && stats.mode!==\'live\' ? \'…\' : \'LIVE\' }}</button>' +
+      '</div>' +
+      '<span v-if="collectorSwitching" style="font-size:10px;color:#58a6ff">切换中…</span>' +
+      '<span v-else style="font-size:10px;color:#54626f">当前: {{ stats.mode.toUpperCase() }}{{ stats.mode===\'live\' ? \' (DHT+PEX+Tracker)\' : stats.mode===\'sim\' ? \' (模拟)\' : \' (已停止)\' }}</span>' +
     '</div>' +
     '<div style="max-width:1680px;margin:0 auto;padding:14px">' +
       '<div class="grid-8" style="display:grid;gap:12px">' +
